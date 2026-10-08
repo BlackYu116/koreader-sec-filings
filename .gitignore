@@ -1,0 +1,5 @@
+.DS_Store
+*.epub
+__pycache__/
+*.pyc
+*.tmp
