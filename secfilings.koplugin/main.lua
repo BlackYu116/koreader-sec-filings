@@ -27,7 +27,7 @@ SEC 研习室 —— 菜单外壳（薄）。
     打开下载目录
     设置                    —— 联系邮箱 / 份数 / 报表类型 / 图片 / 表格宽度 / 清缓存
 
-输出：/mnt/us/documents/SEC 财报/<公司名> SEC 财报.epub
+输出：/mnt/us/documents/SEC 财报/<公司名 [CIK 10位数字]>/<日期 · 类型 · accession · 原文/中文>.epub
 ]]
 
 local DataStorage = require("datastorage")
@@ -118,20 +118,30 @@ end
 --- 关注列表存进插件自己的设置文件（secfilings.lua 的 sec_watchlist 段），
 --- 不另开一个文件：用户要手改的话只需改一个地方。
 function SecFilings:loadWatchlist()
-    local wl, err = SecWatchlist.load(self.settings, {
-        key = "sec_watchlist",
-        seed_defaults = true,
-        companies = self:seedCompanies(),
+    -- Independent baselines: legacy aggregate books must not suppress per-filing downloads.
+    -- Preserve the old key verbatim so rolling back does not lose progress or preferences.
+    local key = "sec_watchlist_filings"
+    local data = self.settings:readSetting(key)
+    local migrating = data == nil
+    if migrating then data = self.settings:readSetting("sec_watchlist") end
+    local wl, err = SecWatchlist.load({[key]=data}, {
+        key=key, seed_defaults=true, companies=self:seedCompanies(),
     })
-    if err then
-        logger.warn("secfilings: 关注列表读取有问题: " .. tostring(err))
+    if data ~= nil and (type(data) ~= "table" or type(data.entries) ~= "table") then
+        err = "关注列表格式无效；保留设置，不自动覆盖"
+        wl.load_error = err
     end
     self.watchlist = wl
+    if err then logger.warn("secfilings: " .. tostring(err)); return end
+    if migrating then
+        SecWatchlist.resetBaseline(wl)
+        self:saveWatchlist()
+    end
 end
 
 function SecFilings:saveWatchlist()
     local ok, err = SecWatchlist.save(self.watchlist, self.settings, {
-        key = "sec_watchlist",
+        key = "sec_watchlist_filings",
     })
     if not ok then
         logger.warn("secfilings: 关注列表保存失败: " .. tostring(err))
@@ -238,6 +248,12 @@ function SecFilings:getSubMenuItems()
     }
 
     items[#items + 1] = {
+        text = _("已有原文 → 生成 / 续译中文版"),
+        help_text = _("只读取本地原文。翻译前显示缓存情况与请求上限，不会重新下载或覆盖原文。"),
+        sub_item_table_func = function() return self:getLocalTranslationItems() end,
+    }
+
+    items[#items + 1] = {
         text = _("下载某一家"),
         sub_item_table_func = function()
             local sub = {}
@@ -273,10 +289,13 @@ function SecFilings:getSubMenuItems()
         sub_item_table_func = function() return self:getSettingItems() end,
     }
 
+    items[#items + 1] = {
+        text = _("版本 0.2.0 · 升级说明"),
+        callback = function() self:showMessage(_("原有合集和阅读进度已保留。新版每份申报单独成书，首次会下载最近几份。中文从「已有原文」生成；旧合集不自动翻译。")) end,
+    }
     return items
 end
 
---- 「下载全部关注的公司」展开成逐家一项：这样某一家失败时其余的照样能做，
 --- 也让用户能只重跑失败的那一家。
 function SecFilings:getBulkDownloadItems()
     local sub = {}
@@ -486,6 +505,16 @@ function SecFilings:getSettingItems()
     }
 
     items[#items + 1] = {
+        text = _("附加公司最新指标（非本份申报）"),
+        help_text = _("默认关闭。打开后附加公司级最新 XBRL 快照，不代表当前申报期，且会增加 SEC 请求。"),
+        checked_func = function() return self.settings:readSetting("company_metrics_snapshot") == true end,
+        callback = function()
+            self.settings:saveSetting("company_metrics_snapshot", self.settings:readSetting("company_metrics_snapshot") ~= true)
+            self.settings:flush()
+        end,
+    }
+
+    items[#items + 1] = {
         text = T(_("表格宽度：%1"), self:tableWidthLabel()),
         help_text = _("按你平时阅读用的字号选。字号调得越大，一行能放的字越少，宽表格就越需要多拆几张。选错只会让表格挤一点，不会丢数字。"),
         sub_item_table_func = function()
@@ -520,8 +549,14 @@ function SecFilings:getSettingItems()
 
     items[#items + 1] = {
         text = _("清空搜索引擎缓存"),
-        help_text = _("缓存的是 SEC 的股票代码总表（一周内不会重取）。搜索找不到公司时可以清一下再试。"),
+        help_text = _("缓存的是 SEC 的股票代码总表（一周内不会重取）。"),
         callback = function() self:clearSearchCache() end,
+    }
+
+    items[#items + 1] = {
+        text = _("翻译设置（DeepSeek）"),
+        help_text = _("翻译默认关闭；仅在你主动选择中文版时使用 API。"),
+        sub_item_table_func = function() return self:getTranslationItems() end,
     }
 
     return items
@@ -917,13 +952,13 @@ end
 function utf8Trim(s, max_bytes)
     if s == nil then return "" end
     if #s <= max_bytes then return s end
-    local cut = s:sub(1, max_bytes)
-    while #cut > 0 do
-        local b = cut:byte(#cut)
+    local cut = max_bytes
+    while cut > 0 do
+        local b = s:byte(cut + 1)
         if b < 0x80 or b >= 0xC0 then break end
-        cut = cut:sub(1, #cut - 1)
+        cut = cut - 1
     end
-    return cut .. "…"
+    return s:sub(1, cut) .. "…"
 end
 
 -- ---------------------------------------------------------------- 下载
@@ -956,33 +991,27 @@ end
 --- 因为 sec_job 的 planView 在 include_reports=false 时会把所有条目的 forms
 --- 改写成 {“8-K”}，那会把刚设好的单类型关注范围冲掉）。
 function SecFilings:startDownload(companies, override)
+    if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
+    if override and override.translate then
+        self:showMessage(_("请先下载原文，再从「已有原文」菜单确认翻译。")); return
+    end
     NetworkMgr:runWhenOnline(function()
+        if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
+        self.sec_busy = true
         Trapper:wrap(function()
             self:runJob(companies, override)
+            self.sec_busy = false
         end)
     end)
 end
 
---- 点搜索结果里的**某一份文件** → 把这家公司的**这一类**文件加进关注范围，
---- 并立即下载最近几份。
----
---- 为什么不「就下这一份」：sec_job 的整条链路是围着「关注列表 + 增量」转的
---- （planUpdates 过滤、基线推进、seen 落账、进度保留）。绕过它单独抓一份要另开
---- 一条打包路径 —— 书名、进度、落账都得再写一遍，而且那条路没有任何现成验证。
---- 用户点一份 13F 的真实意图也几乎总是「这类文件我以后要看」，
---- 折进关注范围既满足了这个意图，又复用了已经跑通的那条链路。
---- 「只下这一次」的入口仍然有：「下载这家最近 N 份」那一项在公司不在
---- 关注列表里时走 sec_job 的 pickLegacy 路径。
+--- An explicit search selection downloads exactly that filing without changing subscriptions.
 function SecFilings:startFilingDownload(company, filing)
-    local form = tostring(filing.form or "")
-    if form == "" then return end
-    self:watchForm(company, form)
-    self:startDownload({ {
-        cik = company.cik,
-        cik_pad = company.cik_pad,
-        name = company.name,
-        ticker = company.ticker,
-    } }, { include_reports = true })
+    local normalized, err = SecWatchlist.normalizeFiling(filing)
+    if not normalized then self:showMessage(tostring(err)); return end
+    self:startDownload({{cik=company.cik, cik_pad=company.cik_pad,
+        name=company.name, ticker=company.ticker}},
+        {include_reports=true, selected_filing=normalized})
 end
 
 --- 封面素材目录：插件自己的 assets/covers/ 下，<cik>.jpg + generic.jpg。
@@ -1012,6 +1041,7 @@ function SecFilings:jobOpts(companies, override)
         limit           = self:getLimit(),
         include_reports = self:includeReports(),
         out_dir         = OUT_DIR,
+        single_filing   = true,
 
         -- 身份。sec_job 的取值顺序：
         --   opts.user_agent > (opts.user_name + opts.user_email) > SecSource.user_agent > 占位串
@@ -1023,8 +1053,8 @@ function SecFilings:jobOpts(companies, override)
         -- 图片（注意开关名是 fetch_images，不是 images）
         fetch_images    = self:downloadImages(),
 
-        -- 关键指标章：取不到会跳过，不会让整本书失败
-        metrics_chapter = true,
+        -- A company-wide latest snapshot is not evidence for this accession; opt in explicitly.
+        metrics_chapter = self.settings:readSetting("company_metrics_snapshot") == true,
 
         -- 表格排版：可用宽度直接用 sec_source 那张实测预设表
         table_width     = self:getTableWidth(),
@@ -1037,6 +1067,7 @@ function SecFilings:jobOpts(companies, override)
 
         -- 封面素材目录（<cik>.jpg + generic.jpg）
         cover_dir       = self:getCoverDir(),
+        translate       = false, -- paid work is only entered through the separate confirmation UI
     }
 
     if type(override) == "table" then
@@ -1113,7 +1144,7 @@ function SecFilings:reportResult(results, errors, info)
     end
 
     local lines = {
-        T(_("完成：成功 %1 家，失败 %2 家。"), #results, #errors),
+        T(_("本轮可用原文 %1 份，问题 %2 项。"), #results, #errors),
     }
 
     if type(info) == "table" then
@@ -1153,7 +1184,7 @@ end
 function SecFilings:showMessage(text)
     local msg = tostring(text)
     if #msg > MAX_UI_MSG then
-        msg = msg:sub(1, MAX_UI_MSG) .. "…"
+        msg = utf8Trim(msg, MAX_UI_MSG - 3)
     end
     UIManager:show(InfoMessage:new{
         text = msg,
@@ -1172,5 +1203,7 @@ function SecFilings:openFolder()
         FileManager:showFiles(OUT_DIR)
     end
 end
+
+for name, method in pairs(require("sec_translation_ui")) do SecFilings[name] = method end
 
 return SecFilings

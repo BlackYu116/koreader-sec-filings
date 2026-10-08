@@ -95,6 +95,8 @@ local SecEpub = require("sec_epub")
 local SecImages = require("sec_images")
 local SecMetrics = require("sec_metrics")
 local SecWatchlist = require("sec_watchlist")
+local Filing = require("sec_filing")
+local Library = require("sec_library")
 
 local SecJob = {}
 
@@ -317,6 +319,14 @@ end
 --- 不静默跳过 —— 静默跳过会表现为「点了下载什么都没发生」。
 ---@return table|nil plan, string|nil err  plan = { {company=, filings={}, update=}, ... }
 local function planRun(src, companies, opts, progress_cb, warnings)
+    if opts.selected_filing then
+        if #companies ~= 1 then return nil, "单份下载必须指定一家公司" end
+        local filing, err = SecWatchlist.normalizeFiling(opts.selected_filing)
+        if not filing or filing.form == "" or not SecWatchlist.isValidDate(filing.date) then
+            return nil, err or "所选申报文件信息不完整"
+        end
+        return {items={{company=companies[1], filings={filing}, explicit=true}}, no_new={}}
+    end
     local wl = opts.watchlist
     local worklist, index, no_new = {}, {}, {}
     local notes = {}
@@ -411,6 +421,9 @@ end
 --- 都打进 zip（sec_epub 会把这个事实报出来）。共享一个 images/ 目录时，清理只能删
 --- 单个 namespace 子目录，漏一点就会把上一家的图也带进下一本书。
 local function bookWorkDir(run_opts, company)
+    if run_opts.current_filing_work_dir then
+        return run_opts.current_filing_work_dir
+    end
     return string.format("%s/co_%s", run_opts.work_dir, tostring(company.cik))
 end
 
@@ -649,12 +662,12 @@ local function metricsChapter(company, run_opts, progress_cb)
         id         = string.format("metrics_%s", tostring(company.cik)),
         company    = company.name,
         company_id = "co_" .. tostring(company.cik),
-        heading    = "关键指标",
+        heading    = run_opts.single_filing and "公司最新指标快照（非本份申报）" or "关键指标",
         -- meta 会被原样插进 content.html，所以自己转义
         meta       = esc(string.format(
             "数据来源 SEC 官方 XBRL（data.sec.gov）｜ 取到 %d / %d 个指标 ｜ 数据截至 %s",
             data.ok_count or 0, #(data.metrics or {}), tostring(data.as_of or "—"))),
-        note       = nil,
+        note       = run_opts.single_filing and "以下为抓取时可获得的公司最新 XBRL 数据，不一定属于本份申报或本期财报；请以各指标标注期间和原文为准。" or nil,
         html       = xhtml,
         metrics    = true,
     }, data, nil, false
@@ -703,12 +716,235 @@ end
 -- 八、跑一轮
 --------------------------------------------------------------------------
 
----@param companies table 要处理的 { {cik=, name=, legal=}, ... }
+local function runSingleFilings(companies, opts, progress_cb)
+    local run_opts = {}
+    for key, value in pairs(opts) do run_opts[key] = value end
+    run_opts.limit = tonumber(opts.limit) or 5
+    run_opts.single_filing = true
+    run_opts.out_dir = opts.out_dir or SecJob.default_out_dir
+    run_opts.work_dir = opts.work_dir or SecJob.default_work_dir
+    run_opts.fetch_images = (opts.fetch_images ~= false)
+    run_opts.metrics_chapter = opts.metrics_chapter and true or false
+    run_opts.keep_progress = false
+    run_opts.progress_policy = opts.progress_policy or SecJob.default_progress_policy
+    run_opts.scan_limit = tonumber(opts.scan_limit) or SecJob.default_scan_limit
+    run_opts.first_run_new = tonumber(opts.first_run_new)
+    run_opts.only_enabled = opts.only_enabled
+    run_opts.watchlist = opts.watchlist
+    run_opts.save_watchlist = opts.save_watchlist
+    run_opts.cover_dir = opts.cover_dir
+    run_opts.table_avail_em = opts.table_avail_em
+    run_opts.table_max_cols = opts.table_max_cols
+    run_opts.table_projection = opts.table_projection
+    run_opts.source = opts.source
+    run_opts.images_fetch = opts.images_fetch
+    run_opts.metrics_fetch = opts.metrics_fetch
+    run_opts.metrics_tags = opts.metrics_tags
+    run_opts.image_max_width = opts.image_max_width
+    run_opts.image_jpeg_quality = opts.image_jpeg_quality
+    run_opts.image_throttle_ms = opts.image_throttle_ms
+    run_opts.image_attempts = opts.image_attempts
+    run_opts.image_timeout = opts.image_timeout
+    run_opts.image_downscale = opts.image_downscale
+
+    local results, errors, warnings = {}, {}, {}
+    local info = { companies = #companies, planned = 0, made = 0, files = 0,
+        images = 0, images_failed = 0, image_bytes = 0,
+        metrics_ok = 0, metrics_failed = 0, no_new = 0,
+        cancelled = false, warnings = warnings, single_filing = true }
+    local library = Library:new(run_opts)
+    local translator = opts.translate and library:translator(opts)
+    local ua, ua_ok = resolveUserAgent(opts)
+    run_opts.user_agent = ua
+    info.user_agent = ua
+    info.user_agent_set = ua_ok
+    if not ua_ok then
+        errors[#errors + 1] = SecJob.USER_AGENT_HINT
+        warnings[#warnings + 1] = SecJob.USER_AGENT_HINT
+    end
+
+    local valid_roots, roots_err = library:validateRoots()
+    if not valid_roots then return results, {roots_err}, info end
+    local ok_dir, dir_err = SecJob.ensureDir(run_opts.out_dir)
+    if not ok_dir then return results, { dir_err }, info end
+    if run_opts.fetch_images then SecJob.ensureDir(run_opts.work_dir) end
+    if translator then
+        local cache_ok, cache_err = SecJob.ensureDir(translator.cache_dir)
+        if not cache_ok then return results, { cache_err }, info end
+    end
+    local translation_files = 0
+    local max_translation_files = math.max(0, math.min(10,
+        math.floor(tonumber(opts.translation_max_files) or 1)))
+    local src = configureSource(run_opts, ua, warnings)
+    run_opts.source = src
+    local plan, plan_err = planRun(src, companies, run_opts, progress_cb, warnings)
+    if not plan then
+        if plan_err == "cancelled" then info.cancelled = true end
+        errors[#errors + 1] = tostring(plan_err)
+        return results, errors, info
+    end
+    local total = 0
+    for pi = 1, #plan.items do total = total + #(plan.items[pi].filings or {}) end
+    info.planned = total
+    info.no_new = #(plan.no_new or {})
+
+    local function addWarning(ctx, text)
+        ctx.warnings[#ctx.warnings + 1] = text
+        warnings[#warnings + 1] = text
+    end
+
+    local function finishOne(result, record, item, ctx)
+        results[#results + 1] = result
+        info.made, info.files = info.made + 1, info.files + 1
+        info.images = info.images + (result.images or 0)
+        info.images_failed = info.images_failed + (result.images_failed or 0)
+        info.image_bytes = info.image_bytes + (result.images_bytes or 0)
+        if result.metrics then info.metrics_ok = info.metrics_ok + 1 end
+        -- Seen means the original AND its resumable snapshot were committed.
+        if item.update and record then
+            item.ok_accns[#item.ok_accns+1] = record.source.filing.accn
+            SecWatchlist.markSeen(run_opts.watchlist, item.company.cik, {record.source.filing.accn}, {})
+        end
+        if translator and record then
+            if translation_files >= max_translation_files then
+                addWarning(ctx, "已达到本轮最多翻译文件数；此份仅生成原文")
+            else
+                translation_files = translation_files + 1
+                local path, err = library:translate(record.paths.cik, record.paths.accn, translator, progress_cb)
+                result.chinese_path = path
+                if not path then
+                    errors[#errors + 1] = string.format("%s %s：中文翻译未完成（%s）",
+                        result.form, result.date, tostring(err))
+                    return result, err == "已取消"
+                end
+            end
+        end
+        return result, false
+    end
+
+    local function buildOne(item, filing, position)
+        local company = item.company
+        local ctx = { skipped = {}, warnings = {}, images = {}, image_bytes = 0,
+            image_failed = 0, chapter_index = 0 }
+        if not tick(progress_cb, string.format("正在处理 %s %s %s（%d / %d）…",
+                company.name, filing.form, filing.date, position, total)) then
+            return nil, true
+        end
+        local valid_paths, path_err = library:validateTargets(company, filing)
+        if not valid_paths then errors[#errors+1] = path_err; return nil, false end
+        local existing, load_err = library:existing(company.cik, filing.accn)
+        if load_err then errors[#errors+1] = load_err; return nil, false end
+        if existing then
+            local valid, verify_err = library:recoverOriginal(existing)
+            if not valid then errors[#errors+1] = verify_err; return nil, false end
+            return finishOne({name=existing.source.company.name, cik=company.cik,
+                accession=filing.accn, form=filing.form, date=filing.date,
+                path=existing.original_path, language="en", chapters=#existing.book.chapters,
+                bytes=SecWatchlist.fileSize(existing.original_path), images=#existing.book.images,
+                images_bytes=0, images_failed=0, warnings=ctx.warnings, skipped=ctx.skipped,
+                reused=true}, existing, item, ctx)
+        end
+        local target = Filing.outputPath(run_opts.out_dir, company, filing, "en")
+        if SecWatchlist.fileExists(target) then
+            errors[#errors+1] = "已有原文但缺少续译快照；未覆盖原文，请保留旧文件后重新下载"
+            return nil, false
+        end
+        local chapters = {}
+        local work_dir, work_err = library:beginOriginal(company, filing)
+        if not work_dir then errors[#errors+1] = work_err; return nil, false end
+        run_opts.current_filing_work_dir = work_dir
+        local metrics_ch, metrics_data, metrics_why, metrics_off =
+            metricsChapter(company, run_opts, progress_cb)
+        if metrics_ch then chapters[#chapters + 1] = metrics_ch end
+        local chapter, cancelled = gatherFiling(src, company, filing, 1,
+            run_opts, progress_cb, ctx)
+        if cancelled then
+            run_opts.current_filing_work_dir = nil
+            return nil, true
+        end
+        if not chapter then
+            run_opts.current_filing_work_dir = nil
+            errors[#errors + 1] = string.format("%s %s %s：正文不可用", company.name,
+                filing.form, filing.date)
+            return nil, false
+        end
+        chapters[#chapters + 1] = chapter
+        local images_dir = work_dir .. "/images"
+        local original_book = {
+            language = "en",
+            identifier = "urn:sec:" .. tostring(company.cik) .. ":" .. filing.accn .. ":en",
+            title = string.format("%s · %s · %s", company.name, filing.form, filing.date),
+            description = string.format("%s %s %s，来源 SEC EDGAR",
+                company.name, filing.form, filing.date),
+            chapters = chapters,
+            images = ctx.images,
+            images_dir = images_dir,
+            cover = prepareCover(run_opts, company, work_dir),
+        }
+        local book = original_book
+        local path = Filing.outputPath(run_opts.out_dir, company, filing, "en")
+        local record, w_err, w_warn = library:publishOriginal(company, filing, book)
+        if type(w_warn) == "table" then
+            for wi = 1, #w_warn do addWarning(ctx, "打包层：" .. tostring(w_warn[wi])) end
+        end
+        if not record then
+            run_opts.current_filing_work_dir = nil
+            errors[#errors + 1] = string.format("%s %s %s：打包失败（%s）",
+                company.name, filing.form, filing.date, tostring(w_err))
+            return nil, false
+        end
+        local size = SecWatchlist.fileSize(path) or 0
+        local result = { name = company.name, cik = company.cik, accession = filing.accn,
+            form = filing.form, date = filing.date, path = path, language = "en",
+            chinese_path = nil, chapters = #chapters, bytes = size, images = #ctx.images,
+            images_bytes = ctx.image_bytes, images_failed = ctx.image_failed,
+            metrics = metrics_ch ~= nil, metrics_ok = metrics_data and metrics_data.ok_count or 0,
+            warnings = ctx.warnings, skipped = ctx.skipped }
+        run_opts.current_filing_work_dir = nil
+        return finishOne(result, record, item, ctx)
+    end
+
+    local position = 0
+    for pi = 1, #plan.items do
+        local item = plan.items[pi]
+        item.ok_accns = {}
+        if item.error then
+            errors[#errors+1] = string.format("%s：%s", item.company.name, tostring(item.error))
+        end
+        for fi = 1, #(item.filings or {}) do
+            position = position + 1
+            local result, cancelled = buildOne(item, item.filings[fi], position)
+            if cancelled then
+                recordSeen(run_opts.watchlist, item.update, item.ok_accns, #item.ok_accns > 0, warnings)
+                info.cancelled = true
+                errors[#errors + 1] = "已取消，剩下的 filing 没有处理"
+                if run_opts.save_watchlist and run_opts.watchlist then
+                    local target = run_opts.save_watchlist
+                    if target == true then target = nil end
+                    SecWatchlist.save(run_opts.watchlist, target)
+                end
+                return results, errors, info
+            end
+        end
+        recordSeen(run_opts.watchlist, item.update, item.ok_accns, #item.ok_accns > 0, warnings)
+    end
+    if run_opts.save_watchlist and run_opts.watchlist then
+        local target = run_opts.save_watchlist
+        if target == true then target = nil end
+        SecWatchlist.save(run_opts.watchlist, target)
+    end
+    return results, errors, info
+end
+
+---@param companies table 要处理的公司数组
 ---@param opts table      见文件头
 ---@param progress_cb function|nil  进度回调，返回 false 表示取消
 ---@return table results, table errors, table info
 function SecJob.run(companies, opts, progress_cb)
     opts = opts or {}
+    if opts.single_filing then
+        return runSingleFilings(companies, opts, progress_cb)
+    end
     local run_opts = {
         limit           = tonumber(opts.limit) or 5,
         include_reports = opts.include_reports and true or false,

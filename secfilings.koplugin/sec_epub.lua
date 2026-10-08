@@ -470,7 +470,7 @@ function SecEpub:buildContentOpf(book, bookid, plan)
   <metadata>
     <dc:title>%s</dc:title>
     <dc:identifier id="bookid">%s</dc:identifier>
-    <dc:language>zh</dc:language>
+    <dc:language>%s</dc:language>
     <dc:creator>SEC EDGAR</dc:creator>
     <dc:publisher>KOReader secfilings</dc:publisher>
     <dc:description>%s</dc:description>%s
@@ -482,7 +482,7 @@ function SecEpub:buildContentOpf(book, bookid, plan)
     <itemref idref="content"/>
   </spine>
 </package>
-]], esc(book.title), esc(bookid), esc(book.description or book.title), cover_meta,
+]], esc(book.title), esc(bookid), esc(book.language or "zh"), esc(book.description or book.title), cover_meta,
     table.concat(manifest, "\n    "))
 end
 
@@ -490,7 +490,7 @@ end
 --- 先写 .tmp，成功后替换 —— 避免 KOReader 正持有原文件时把它写坏。
 ---@return boolean ok, string|nil err, table|nil warnings
 function SecEpub:write(epub_path, book)
-    local bookid = "secfilings_" .. tostring(os.time())
+    local bookid = book.identifier or ("secfilings_" .. tostring(os.time()))
     book.description = book.description or ""
 
     local plan, plan_err, warnings = self:imagePlan(book)
@@ -544,7 +544,9 @@ function SecEpub:write(epub_path, book)
 
     -- 注意：Archiver.Writer:close() **不返回状态值**（总是 nil），所以不能拿它判成败。
     -- 用产出的文件本身验证：大小、以及能不能当 zip 再打开。
+    local archive_error = epub.err
     epub:close()
+    if archive_error or epub.err then return false, "写入 EPUB 条目失败" end
 
     local attr = lfs.attributes(tmp)
     if not attr or (attr.size or 0) < 500 then
