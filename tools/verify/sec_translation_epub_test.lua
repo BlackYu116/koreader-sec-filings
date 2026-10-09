@@ -22,7 +22,7 @@ local f=assert(io.open(dir .. "/images/chart.png","wb")); f:write(png); f:close(
 local cover=assert(io.open(dir .. "/images/cover.png","wb")); cover:write(png); cover:close()
 local paragraph='<p>Revenue was $1,234.50 &amp; Assets were 200 in 2026.</p>'
 local html=string.rep(paragraph,80) .. '<table><tr><th>Revenue</th><th>2026</th></tr><tr><td>Profit</td><td style="text-align: right">(500)</td></tr></table><p><img src="images/chart.png" alt="Chart"/></p>'
-local book={title="Quarterly Filing",language="en",chapters={{id="one",heading="Quarterly results",html=html}},
+local book={title="Quarterly Filing",language="en",identifier="urn:sec:fixture:en",chapters={{id="one",heading="Quarterly results",html=html}},
     images={{href="images/chart.png",mediaType="image/png"}},images_dir=dir .. "/images",
     cover={href="images/cover.png",mediaType="image/png"}}
 local original=Filing.outputPath(opts.out_dir,co,filing,"en")
@@ -40,6 +40,27 @@ assert(stats.requests==3,"repeated paragraph estimated only once")
 local path=assert(lib:translate(co.cik,filing.accn,translator))
 assert(calls==3,"cached repeated paragraphs dispatch only once")
 assert(Files.readFile(original)~=Files.readFile(path),"independent language files")
+-- Reconstruct with the REAL archiver, not the unit-test writer. Preserve both sidecars.
+local source_before=assert(Files.readFile(record.paths.source))
+local state_before=assert(Files.readFile(record.paths.state))
+local chinese_before=assert(Files.readFile(path))
+local backup=assert(io.open(root.."/original-before-recovery.zip","wb"))
+assert(backup:write(assert(Files.readFile(original)))); assert(backup:close())
+for i,bookpath in ipairs({original,path}) do
+    assert(Files.ensureDir(bookpath..".sdr"))
+    local progress=assert(io.open(bookpath..".sdr/metadata.epub.lua","wb"))
+    progress:write("return {page=8}"); progress:close()
+end
+assert(os.remove(original))
+assert(lib:restoreOriginal(assert(lib:previewOriginalRecovery(co.cik,filing.accn))))
+assert(lib:verify(assert(lib:load(co.cik,filing.accn))))
+assert(Files.readFile(record.paths.source)==source_before)
+assert(Files.readFile(record.paths.state)==state_before)
+assert(Files.readFile(path)==chinese_before)
+for i,bookpath in ipairs({original,path}) do
+    assert(Files.readFile(bookpath..".sdr/metadata.epub.lua")=="return {page=8}")
+end
+print("PASS real EPUB original reconstruction; source/state/Chinese/reading records preserved")
 print("ORIGINAL=" .. original)
 print("CHINESE=" .. path)
 print("PASS real EPUB pair generated; fixture API calls=3; host/device environment must be reported separately")

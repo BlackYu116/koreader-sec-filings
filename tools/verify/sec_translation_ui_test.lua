@@ -17,7 +17,7 @@ package.loaded["ffi/util"]={template=function(s,...)
 end}
 package.loaded["logger"]={info=function() end,warn=function() end}
 package.loaded["ui/uimanager"]={show=function(self,w) shown[#shown+1]=w end,close=function() end}
-for i,name in ipairs({"infomessage","inputdialog","confirmbox"}) do
+for i,name in ipairs({"infomessage","inputdialog","confirmbox","menu"}) do
     package.loaded["ui/widget/" .. name]={new=function(self,o) o.kind=name; o.onShowKeyboard=function() end; return o end}
 end
 package.loaded["ui/network/manager"]={runWhenOnline=function(self,f) network=network+1; f() end}
@@ -129,6 +129,27 @@ Lib.estimate,os.time=saved_estimate,saved_time
 check(yields-before_yields==1 and not plugin.sec_busy,"one thousand local checks do not incur one thousand 100ms UI waits")
 check(find(plugin:getSubMenuItems(),"存储与清理"),"main menu exposes explicit storage management")
 assert(os.remove(r.original_path)); assert(os.remove(r.chinese_path))
+-- New local repair actions never consult network or mutate account settings.
+local missing_actions=plugin:getLocalTranslationItems()[1].sub_item_table_func()
+check(find(missing_actions,"恢复原文") and find(missing_actions,"重新关联原文"),"missing original offers explicit recovery and relink")
+plugin:prepareOriginalRecovery(co.cik,filing.accn)
+local repair=shown[#shown]
+check(repair.kind=="confirmbox" and not Files.fileExists(r.original_path),"recovery preview does not recreate a deleted original")
+plugin.ui.document={file="open.epub"}; repair.ok_callback(); plugin.ui.document=nil
+check(not Files.fileExists(r.original_path) and not plugin.sec_busy,"reader opening after confirmation blocks recovery")
+local oldcalls,oldnetwork,oldsaves=calls,network,saves
+plugin:prepareOriginalRecovery(co.cik,filing.accn); repair=shown[#shown]
+repair.ok_callback(); repair.ok_callback()
+check(Files.fileExists(r.original_path) and not plugin.sec_busy and calls==oldcalls and network==oldnetwork and saves==oldsaves,"confirmed offline repair runs once without settings or API writes")
+local moved=plugin.sec_out_dir.."/moved.epub"; assert(os.rename(r.original_path,moved))
+plugin:prepareRelink(co.cik,filing.accn,"en")
+local chooser=shown[#shown]
+check(chooser.kind=="menu" and #chooser.item_table==1,"relink exposes verified candidate chooser")
+chooser.onMenuSelect(chooser,chooser.item_table[1]); local bind=shown[#shown]
+check(bind.kind=="confirmbox" and assert(lib:load(co.cik,filing.accn)).original_path~=moved,"candidate selection still requires explicit confirmation")
+bind.ok_callback(); bind.ok_callback()
+check(assert(lib:load(co.cik,filing.accn)).original_path==moved and calls==oldcalls and network==oldnetwork and saves==oldsaves,"confirmed relink changes only local binding metadata")
+assert(os.remove(moved))
 local storage=plugin:getStorageItems()
 check(find(storage,"检查到") and find(plugin:getLocalTranslationItems(),"文件位置待核对"),"external removal is discovered without displaying phantom pending translation")
 local identity=r.paths.cik .. ":" .. r.paths.accn

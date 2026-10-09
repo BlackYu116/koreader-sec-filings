@@ -1,10 +1,23 @@
 # KOReader SEC Filings — SEC 研习室
 
-**Version 0.2.1** · [中文使用说明](README.zh-CN.md)
+**Version 0.2.2** · [中文使用说明](README.zh-CN.md)
 
-> Version 0.2.1 was deployed to the test Kindle on 2026-10-09. Isolated device tests and the real storage/preview/cancel UI passed; the user then separately approved removal of 29 existing residue files, which completed with settings and company indexes unchanged. See [deployment](docs/DEPLOYMENT-0.2.1.md) and [lifecycle validation](docs/VALIDATION-LIFECYCLE.md).
+> Version 0.2.2 was backed up, installed and loaded through a normal KOReader restart on the test Kindle on 2026-10-09. All 26 installed files match the source and local package; protected settings and SEC data are unchanged. See [deployment and validation limits](docs/DEPLOYMENT-0.2.2.md). This source revision contains 0.2.2; no GitHub Release or tag was created.
 
 Read SEC EDGAR filings as local EPUBs in KOReader. Download an individual filing, preserve its source snapshot, and optionally produce a separate Chinese edition using your own DeepSeek account. No AI-assistant plugin is required.
+
+## New in 0.2.2: recovery and search
+
+The `feat/recovery-location-search` branch adds explicit offline original reconstruction, hash-verified relinking within the configured SEC library, and an immediate search-results panel. These additions are installed on the test Kindle as 0.2.2.
+
+- Restore a missing original from its valid snapshot and assets after confirmation. Source/translation records, Chinese EPUBs and reading sidecars are preserved. Relink a moved book first to avoid making another copy.
+- Relink an original or Chinese edition by selecting an identical-content candidate inside the managed library. Only location metadata is changed; books and sidecars are not moved. External locations, modified content and unsafe links are refused.
+- Search, company selection, filtering and pagination display results directly. Positions are retained; complete result sets can be filtered locally. Partial sets keep a visible warning, failed requests preserve valid results, and obsolete callbacks cannot replace a newer query.
+- Corrupt snapshots, missing assets and unproven interrupted staging remain blocked. Ordinary receipt-write errors clean up only verifiably owned scratch from that attempt; unknown crash residue is not silently discarded. This is not a power-loss or cross-process transaction guarantee.
+
+The three-year search window and platform restrictions remain unchanged. See [development validation](docs/VALIDATION-RECOVERY-SEARCH.md) for test and deployment boundaries.
+
+Project handoff and planning boundaries: [current project status](docs/PROJECT-STATUS.md). The full local host-test runner/adapters are outside this Git repository; clean-clone CI is still pending.
 
 ## Features
 
@@ -33,7 +46,7 @@ No launcher, user patch, root filesystem modification or background service is r
 
 The interface is Chinese. The Tools menu may span two pages.
 
-- **搜索公司…**: search, then reopen **搜索结果** as prompted. Selecting a dated filing downloads only that accession.
+- **搜索公司…**: search and view the results directly; filtering also returns to the results panel. Selecting a dated filing downloads only that accession.
 - **下载某一家 / 下载全部关注的公司**: download recent new filings according to your preferences.
 - **打开下载目录**: browse generated books.
 - **已有原文 → 生成 / 续译中文版**: choose an original and review translation limits.
@@ -69,7 +82,7 @@ Legacy EPUBs and sidecars remain in place. They are not automatically imported a
 
 ## Validation
 
-The released 0.2.0 version was installed and loaded on the test Kindle; the separate 0.2.1 deployment record describes cleanup validation and its remaining boundaries. Validation includes offline engine/orchestration/state tests; the actual `main.lua` under native Kindle JSON, lfs and SHA dependencies; native libarchive EPUB creation; and screen captures plus native input-event testing of menus, search, exact-filing download and reading.
+Version 0.2.2 passed 267 device-dependency checks and 14 additional native-widget callback/rendering checks before deployment. Offline network replies, simulated link/case fixtures and programmatic widget callbacks are explicitly distinguished from end-to-end touch and model validation in its deployment record. Earlier 0.2.0 and 0.2.1 records preserve historical download and cleanup evidence. Validation includes offline engine/orchestration/state tests; the actual `main.lua` under native Kindle JSON, lfs and SHA dependencies; native libarchive EPUB creation; and screen captures plus native input-event testing of menus, search, exact-filing download and reading.
 
 A real Apple 10-Q filed on 2026-07-31 was downloaded through the production UI. ZIP/XML, navigation, 70 tables, embedded source imagery and the cover passed independent checks. Tests and the explicit-sandbox shell entry point are in `tools/verify/`.
 

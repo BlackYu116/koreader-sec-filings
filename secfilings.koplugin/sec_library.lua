@@ -13,7 +13,7 @@ local MAX_SOURCE = 32 * 1024 * 1024
 local statuses = {pending=true, translating=true, paused=true, failed=true, publishing=true, complete=true}
 
 local function safePath(path)
-    if type(path) ~= "string" or path:find("[%c\\]") then return nil end
+    if type(path) ~= "string" or path:find("[%c\\]") or path:find("//",1,true) then return nil end
     local allowed = path:match("^/mnt/us/[^/]+")
     if require("ffi").os == "OSX" then allowed = allowed or path:match("^/Users/[^/]+/[^/]+") end
     if not allowed or not lfs.symlinkattributes then return nil end
@@ -21,7 +21,9 @@ local function safePath(path)
     for part in path:gmatch("[^/]+") do
         if part == "." or part == ".." then return nil end
         prefix = prefix .. "/" .. part
-        if lfs.symlinkattributes(prefix, "mode") == "link" then return nil end
+        local a = lfs.symlinkattributes(prefix)
+        if a and (a.mode == "link" or a.mode == "file" and (a.nlink or 1) ~= 1
+                or prefix ~= path and a.mode ~= "directory") then return nil end
     end
     return path
 end
@@ -88,11 +90,13 @@ local function hashFile(path)
     if not safePath(path) or lfs.symlinkattributes(path, "mode") ~= "file" then return nil end
     local f = io.open(path, "rb")
     if not f then return nil end
-    local hash = sha256()
+    local hash, bytes = sha256(), 0
     while true do
         local chunk, err = f:read(65536)
         if err then f:close(); return nil end
         if not chunk then break end
+        bytes = bytes + #chunk
+        if bytes > 256 * 1024 * 1024 then f:close(); return nil end
         hash(chunk)
     end
     f:close()
@@ -241,9 +245,9 @@ function Library:load(cik, accn)
         state.company, state.filing = source.company, source.filing
     end -- A power interruption after source.json but before state commit is recoverable.
     book.images_dir = assetDirectory(p, source)
-    return {paths=p, source=source, state=state, book=book,
+    return require("sec_repair").apply(self, {paths=p, source=source, state=state, book=book,
         original_path=Filing.outputPath(self.out_dir, source.company, source.filing, "en"),
-        chinese_path=Filing.outputPath(self.out_dir, source.company, source.filing, "zh")}
+        chinese_path=Filing.outputPath(self.out_dir, source.company, source.filing, "zh")})
 end
 
 function Library:existing(cik, accn)
@@ -310,15 +314,20 @@ function Library:recoverOriginal(r)
     if not p then return nil, err end
     if lfs.symlinkattributes(r.original_path) then return self:verify(r) end
     local staged = r.original_path .. ".building.epub"
-    if hashFile(staged) ~= r.source.original_hash then return nil, "原文缺失，且没有可恢复的已校验暂存文件" end
+    if r.recovery and lfs.symlinkattributes(r.paths.rebuild) then staged = r.paths.rebuild end
+    if not safePath(r.original_path) then return nil, "原文路径无效" end
+    if hashFile(staged) ~= r.original_hash then return nil, "原文缺失；请在已有原文中选择「恢复原文」或「重新关联」" end
     if not os.rename(staged, r.original_path) then return nil, "原文发布未完成；再次下载可恢复，快照已保留" end
     return self:verify(r)
 end
 
 function Library:verify(record)
-    if hashFile(record.original_path) ~= record.source.original_hash then
+    if hashFile(record.original_path) ~= record.original_hash then
         return nil, "原文 EPUB 缺失或已变化；未发送翻译请求"
     end
+    return self:verifyAssets(record)
+end
+function Library:verifyAssets(record)
     local assets = record.source.assets
     local images = {}; for i = 1, #record.book.images do images[#images+1] = record.book.images[i] end
     if record.book.cover then images[#images+1] = record.book.cover end
@@ -371,6 +380,10 @@ function Library:translate(cik, accn, translator, progress_cb)
     local cache = r.paths.dir .. "/translation-cache"
     if not safePath(cache) or translator.cache_dir ~= cache then return nil, "翻译缓存目录无效" end
     ok, err = Files.ensureDir(cache); if not ok then return nil, err end
+    local parent = r.chinese_path:match("^(.*)/[^/]+$")
+    if not safePath(parent) then return nil, "中文版目录无效或包含链接" end
+    ok, err = Files.ensureDir(parent); if not ok then return nil, err end
+    ok, err = self:rememberChineseIdentity(r); if not ok then return nil, err end
     state.status, state.fingerprint = "translating", fingerprint
     state.output_hash = nil
     ok, err = self:saveState(r.paths, state); if not ok then return nil, err end
@@ -442,6 +455,12 @@ function Library:list()
                         if valid then
                             local en = Filing.outputPath(self.out_dir, company, filing, "en")
                             local zh = Filing.outputPath(self.out_dir, company, filing, "zh")
+                            if lfs.symlinkattributes(p.dir .. "/locations.json")
+                                    or lfs.symlinkattributes(p.dir .. "/original-recovery.json") then
+                                local linked = self:load(cik, accn)
+                                if linked then en, zh = linked.original_path, linked.chinese_path
+                                else en, zh = nil, nil; damaged = damaged + 1 end
+                            end
                             local en_ok = safePath(en) and lfs.symlinkattributes(en, "mode") == "file" or false
                             local zh_ok = safePath(zh) and lfs.symlinkattributes(zh, "mode") == "file" or false
                             out[#out+1] = {cik=cik, accn=accn, name=company.name,
@@ -458,4 +477,6 @@ function Library:list()
         return a.cik .. a.accn < b.cik .. b.accn end)
     return out, damaged
 end
+require("sec_repair").install(Library, {safePath=safePath, read=read, decode=decode,
+    atomic=atomic, hashFile=hashFile})
 return Library

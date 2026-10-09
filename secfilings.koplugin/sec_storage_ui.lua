@@ -17,6 +17,12 @@ function StorageUI:getLocalFilingActions(entry)
     return {
         {text=_("生成 / 续译中文版"),enabled=entry.original_present,
             callback=function() self:prepareTranslation(entry.cik,entry.accn) end},
+        {text=_("恢复原文（不联网）…"),enabled=not entry.original_present,
+            callback=function() self:prepareOriginalRecovery(entry.cik,entry.accn) end},
+        {text=_("重新关联原文位置…"),enabled=not entry.original_present,
+            callback=function() self:prepareRelink(entry.cik,entry.accn,'en') end},
+        {text=_("重新关联中文版位置…"),enabled=not entry.chinese_present,
+            callback=function() self:prepareRelink(entry.cik,entry.accn,'zh') end},
         {text=_("删除整份资料及本地阅读记录…"),
             callback=function() self:prepareCleanup({id},{remove_books=true,remove_reading_data=true}) end},
         {text=_("存储与清理（检查移动及残留）"),

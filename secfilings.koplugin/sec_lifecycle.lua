@@ -174,7 +174,7 @@ function Lifecycle:scan()
                         row.state=r.state.status
                         row.original_path,row.chinese_path=r.original_path,r.chinese_path
                         row.source_hash=r.state.source_hash
-                        row.original_hash,row.output_hash=r.source.original_hash,r.state.output_hash
+                        row.original_hash,row.output_hash=r.original_hash,r.chinese_hash
                         row.assets={}
                         row.images_dir=r.book.images_dir
                         for href,h in pairs(r.source.assets) do
@@ -194,6 +194,16 @@ function Lifecycle:scan()
                         for k,path in ipairs({r.original_path,r.chinese_path}) do
                             for z,suffix in ipairs({'.building.epub','.building.epub.tmp','.tmp'}) do
                                 if s.map[path..suffix] then row.status,row.blocked='recoverable','有未完成发布文件，请先恢复任务' end
+                            end
+                        end
+                        if s.map[r.paths.rebuild] or s.map[r.paths.rebuild..'.tmp'] then
+                            row.status,row.blocked='recoverable','有原文恢复暂存，请先完成恢复'
+                        end
+                        for k,path in ipairs({r.original_path,r.chinese_path}) do
+                            -- FAT/APFS can resolve a case alias not present as that exact
+                            -- spelling in the inventory. Never label an existing book missing.
+                            if not s.map[path] and lfs.symlinkattributes(path) then
+                                row.status,row.blocked='unknown','成品路径与扫描结果不一致，请先核对文件名'
                             end
                         end
                         if r.state.status=='publishing' then row.status,row.blocked='recoverable','发布状态待恢复' end
@@ -317,7 +327,8 @@ function Lifecycle:preview(ids, opts)
                 local ok,e=sidecar(row.dir,true); if not ok then return nil,e end
             else
                 local source=row.dir..'/source.json'
-                local allowed={[source]=true,[row.dir..'/translation.json']=true}
+                local allowed={[source]=true,[row.dir..'/translation.json']=true,
+                    [row.dir..'/locations.json']=true,[row.dir..'/original-recovery.json']=true}
                 local directories={[row.dir]=true,[row.dir..'/translation-cache']=true}
                 local function ancestors(path)
                     while inside(path,row.dir) do directories[path]=true; path=path:match('^(.*)/[^/]+$') end
@@ -355,7 +366,8 @@ function Lifecycle:preview(ids, opts)
         local function rank(x)
             if x.path:match('/source%.json$') then return 3 end
             if x.path:match('/cleanup%.json$') then return 2 end
-            if x.path:match('/translation%.json$') then return 1 end
+            if x.path:match('/translation%.json$') or x.path:match('/locations%.json$')
+                    or x.path:match('/original%-recovery%.json$') then return 1 end
             return 0
         end
         local ar,br=rank(a),rank(b); return ar==br and a.path<b.path or ar<br
@@ -418,7 +430,30 @@ function Lifecycle:execute(public)
             end
         end
     end
+    -- Finish book-sidecar directories while identity/location receipts still exist.
+    -- A renamed sidecar cannot be reconstructed from the legacy empty-dir journal.
+    local out_finished=false
+    local function finishOutDirs()
+        if out_finished then return true end
+        local dirs={}
+        for path in pairs(p.dirs) do if inside(path,self.out_dir) then dirs[#dirs+1]=path end end
+        table.sort(dirs,function(a,b) return #a>#b end)
+        for i,path in ipairs(dirs) do
+            if lfs.symlinkattributes(path) then
+                local a=safeExisting(path)
+                local children=a and a.mode=='directory' and names(path)
+                if not children or #children>0 or not os.remove(path) then
+                    return nil,'阅读目录未移除；定位资料已保留，请重新检查'
+                end
+            end
+        end
+        out_finished=true; return true
+    end
     for i,file in ipairs(p.files) do
+        if file.path:match('/source%.json$') or file.path:match('/translation%.json$')
+                or file.path:match('/locations%.json$') or file.path:match('/original%-recovery%.json$') then
+            local done,why=finishOutDirs(); if not done then return fail(why) end
+        end
         if not reserved[file.path] then
             local ok,err=self:roots(); if not ok then return fail(err) end
             local a; a,err=safeExisting(file.path); if not a then return fail(err) end
@@ -428,6 +463,7 @@ function Lifecycle:execute(public)
             report.remaining=report.remaining-1
         end
     end
+    local done,why=finishOutDirs(); if not done then return fail(why) end
     local dirs={}; for path in pairs(p.dirs) do dirs[#dirs+1]=path end
     table.sort(dirs,function(a,b) return #a>#b end)
     for i,path in ipairs(dirs) do

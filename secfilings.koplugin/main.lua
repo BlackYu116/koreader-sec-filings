@@ -63,9 +63,8 @@ local MAX_UI_MSG = 260
 --- 「不设 limit」是**故意的**：limit 会让「边扫边筛」提前收工，类型分布就只能统计到
 --- 被截断的那一段，筛选项会变成假的（实测 Apple 给 limit=12 时分布里只剩 Form 4）。
 --- 真正的边界由 since（时间窗）和 max_total（内存上限）给。
-local SEARCH_SINCE_YEARS = 3
+local SEARCH_SINCE_YEARS = require("sec_search_ui").search_years
 local SEARCH_PAGE_SIZE = 20
-local SEARCH_MAX_TOTAL = 5000
 --- 类型筛选菜单里最多列几种类型（按份数从多到少；其余用「全部类型」看）。
 local SEARCH_FORM_CHOICES = 12
 --- 一眼能看出「这是财报」的三类。内部人交易（Form 4）一份就是几页，
@@ -237,7 +236,7 @@ function SecFilings:getSubMenuItems()
     if self.search_state then
         items[#items + 1] = {
             text = self:searchStateLabel(),
-            sub_item_table_func = function() return self:getSearchItems() end,
+            callback = function() self:showSearchResults() end,
         }
     end
 
@@ -296,8 +295,8 @@ function SecFilings:getSubMenuItems()
     }
 
     items[#items + 1] = {
-        text = _("版本 0.2.1 · 清理说明"),
-        callback = function() self:showMessage(_("删书后打开「存储与清理」检查残留，确认后清理。不后台静默删除，不清空其他书的缓存或关注列表。")) end,
+        text = _("版本 0.2.2 · 恢复与清理"),
+        callback = function() self:showMessage(_("原文缺失或书籍移动后，在「已有原文」确认恢复或重新关联。删书后打开「存储与清理」检查残留。不后台静默删除，不清空其他书的缓存或关注列表。")) end,
     }
     return items
 end
@@ -652,80 +651,11 @@ function SecFilings:searchOpts()
     }
 end
 
-function SecFilings:startSearch(query)
-    NetworkMgr:runWhenOnline(function()
-        Trapper:wrap(function() self:runSearch(query) end)
-    end)
-end
-
---- 解析公司名。注意：这一步之后可能还需要用户再选一次（同分候选），
---- 所以把候选存进 search_state，由菜单渲染，而不是在这里弹窗硬选。
-function SecFilings:runSearch(query)
-    Trapper:info(T(_("正在查找「%1」…"), query))
-    local ok, res, err, kind = SecSearch:resolve(query, self:searchOpts())
-    if not ok then
-        Trapper:reset()
-        self.search_state = nil
-        self:showMessage(T(_("查找失败：%1"), self:explainError(err, kind)))
-        return
-    end
-
-    local aliases = res.aliases or { res }
-    if #aliases > 1 and (res.ambiguous or res.tie) then
-        Trapper:reset()
-        self.search_state = { query = query, candidates = aliases }
-        self:showMessage(T(_("「%1」匹配到 %2 家公司。请到 工具 → SEC 研习室 → 搜索结果 里挑一家。"),
-            query, #aliases))
-        return
-    end
-
-    self:loadFilings(res, query)
-end
-
 function SecFilings:sinceDate(years)
     local t = os.date("*t", os.time())
-    return string.format("%04d-%02d-%02d", t.year - years, t.month, t.day)
-end
-
-function SecFilings:loadFilings(res, query, form)
-    Trapper:info(T(_("正在列出 %1 的文件…"), tostring(res.name or res.cik)))
-    local opts = self:searchOpts()
-    opts.since = self:sinceDate(SEARCH_SINCE_YEARS)
-    opts.max_total = SEARCH_MAX_TOTAL
-    if form then opts.forms = { form } end
-    local ok, list, err, kind = SecSearch:listFilings(res.cik_num or res.cik, opts)
-    Trapper:reset()
-    if not ok then
-        self.search_state = nil
-        self:showMessage(T(_("列出文件失败：%1"), self:explainError(err, kind)))
-        return
-    end
-
-    local previous = self.search_state
-    self.search_state = {
-        query = query,
-        company = {
-            cik = list.cik_num or res.cik_num,
-            cik_pad = list.cik or res.cik,
-            name = list.name or res.name or tostring(res.cik),
-            ticker = (res.tickers and res.tickers[1]) or res.ticker,
-        },
-        list = list,
-        form = form,
-        form_key = form,
-        page = 1,
-        -- 类型分布只有在「不筛类型」那一次才是完整的，筛过之后就只剩一种，
-        -- 所以筛选项必须留着上一次的全量分布，否则菜单会塌成一个选项。
-        summary = (not form) and list.form_summary
-            or (previous and previous.summary) or nil,
-    }
-
-    local extra = ""
-    if list.truncated then
-        extra = _("（被上限截断，更早的没列出来）")
-    end
-    self:showMessage(T(_("找到 %1 份文件%2。请到 工具 → SEC 研习室 → 搜索结果 看清单。"),
-        list.matched or #list.entries, extra))
+    local year = t.year - years
+    if t.month == 2 and t.day == 29 and (year % 4 ~= 0 or year % 100 == 0 and year % 400 ~= 0) then t.day = 28 end
+    return string.format("%04d-%02d-%02d", year, t.month, t.day)
 end
 
 function SecFilings:searchStateLabel()
@@ -767,7 +697,8 @@ function SecFilings:getSearchItems()
     local company = st.company or {}
     local total = #entries
     local pages = math.max(1, math.ceil(total / SEARCH_PAGE_SIZE))
-    local page = math.min(math.max(1, tonumber(st.page) or 1), pages)
+    local page = math.min(math.max(1, math.floor(tonumber(st.page) or 1)), pages)
+    st.page = page
 
     sub[#sub + 1] = {
         text = st.form and T(_("共 %1 份「%2」（近 %3 年）"), total, st.form, SEARCH_SINCE_YEARS)
@@ -797,18 +728,19 @@ function SecFilings:getSearchItems()
         sub[#sub + 1] = {
             text = T(_("「%1」已在关注列表里（点一下取消关注）"), tostring(company.name)),
             help_text = _("关注列表里的公司会被「下载全部关注的公司」带上。"),
-            callback = function() self:toggleWatch(company.cik) end,
+            callback = function() self:toggleWatch(company.cik); self:showSearchResults() end,
         }
     else
         sub[#sub + 1] = {
             text = T(_("关注「%1」（以后自动下载新文件）"), tostring(company.name)),
             help_text = _("关注之后不必每次自己搜；插件会按报表类型设置抓新的那几份。"),
-            callback = function() self:watchCompany(company) end,
+            callback = function() self:watchCompany(company); self:showSearchResults() end,
         }
     end
 
     sub[#sub + 1] = {
         text = T(_("下载这家最近 %1 份（照报表类型设置）"), self:getLimit()),
+        close_search = true,
         callback = function()
             self:startDownload({ {
                 cik = company.cik,
@@ -821,7 +753,7 @@ function SecFilings:getSearchItems()
 
     if total == 0 then
         sub[#sub + 1] = {
-            text = _("这 %1 年里没有符合条件的文件。"),
+            text = T(_("这 %1 年里没有符合条件的文件。"), SEARCH_SINCE_YEARS),
             callback = function() self:showMessage(_("时间窗内没有文件。")) end,
         }
         return sub
@@ -833,6 +765,7 @@ function SecFilings:getSearchItems()
         local f = entries[fi]
         sub[#sub + 1] = {
             text = self:filingLabel(f),
+            close_search = true,
             callback = function() self:startFilingDownload(company, f) end,
         }
     end
@@ -841,13 +774,13 @@ function SecFilings:getSearchItems()
         if page < pages then
             sub[#sub + 1] = {
                 text = T(_("下一页（第 %1 / %2 页）"), page + 1, pages),
-                callback = function() st.page = page + 1 end,
+                callback = function() st.page = page + 1; self:showSearchResults() end,
             }
         end
         if page > 1 then
             sub[#sub + 1] = {
                 text = T(_("上一页（第 %1 / %2 页）"), page - 1, pages),
-                callback = function() st.page = page - 1 end,
+                callback = function() st.page = page - 1; self:showSearchResults() end,
             }
         end
     end
@@ -892,55 +825,12 @@ function SecFilings:getFormFilterItems()
     return sub
 end
 
---- 按类型（一个或多个）重新筛。会联网重取，所以菜单会关掉，
---- 用户重新打开「搜索结果」时就是篘过的那一份。
-function SecFilings:setSearchForms(forms)
-    local st = self.search_state
-    if not st or not st.company then return end
-    NetworkMgr:runWhenOnline(function()
-        Trapper:wrap(function() self:refilterSearch(forms) end)
-    end)
-end
-
-function SecFilings:refilterSearch(forms)
-    local st = self.search_state
-    if not st or not st.company then return end
-    local label = forms and table.concat(forms, "/") or _("全部")
-    Trapper:info(T(_("正在筛出「%1」…"), label))
-    local opts = self:searchOpts()
-    opts.since = self:sinceDate(SEARCH_SINCE_YEARS)
-    opts.max_total = SEARCH_MAX_TOTAL
-    opts.forms = forms
-    local ok, list, err, kind = SecSearch:listFilings(st.company.cik, opts)
-    Trapper:reset()
-    if not ok then
-        self:showMessage(T(_("筛选失败：%1"), self:explainError(err, kind)))
-        return
-    end
-    st.list = list
-    st.form = forms and table.concat(forms, "/") or nil
-    st.form_key = forms and table.concat(forms, ",") or nil
-    st.page = 1
-    self:showMessage(T(_("筛出 %1 份。请重新打开 工具 → SEC 研习室 → 搜索结果。"),
-        list.matched or #list.entries))
-end
-
 function SecFilings:candidateLabel(cand)
     local label = tostring(cand.name or cand.cik)
     if cand.ticker and cand.ticker ~= "" then
         label = cand.ticker .. " · " .. label
     end
     return label
-end
-
-function SecFilings:pickCandidate(cand, query)
-    self:loadFilings({
-        cik = cand.cik,
-        cik_num = cand.cik_num or cand.cik,
-        name = cand.name,
-        ticker = cand.ticker,
-        tickers = cand.ticker and { cand.ticker } or nil,
-    }, query)
 end
 
 function SecFilings:filingLabel(f)
@@ -1212,5 +1102,7 @@ end
 
 for name, method in pairs(require("sec_translation_ui")) do SecFilings[name] = method end
 for name, method in pairs(require("sec_storage_ui")) do SecFilings[name] = method end
+for name, method in pairs(require("sec_repair_ui")) do SecFilings[name] = method end
+for name, method in pairs(require("sec_search_ui")) do SecFilings[name] = method end
 
 return SecFilings
