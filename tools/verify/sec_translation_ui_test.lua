@@ -74,7 +74,7 @@ local f=assert(io.open(Filing.outputPath(plugin.sec_out_dir,co,filing,"en"),"wb"
 local lib=Lib:new(plugin:translationOptions())
 local r=assert(lib:register(co,filing,{title="Quarter",chapters={{id="one",heading="Results",html="<p>Revenue 10.</p>"}}}))
 settings.deepseek_api_key=""
-plugin:getLocalTranslationItems()[1].callback()
+plugin:getLocalTranslationItems()[1].sub_item_table_func()[1].callback()
 check(shown[#shown].kind=="confirmbox" and calls==0 and network==0,"cache-only preflight shows confirmation without key/network")
 local confirmation=shown[#shown]
 confirmation.ok_callback()
@@ -127,4 +127,20 @@ end
 plugin:prepareTranslation(co.cik,filing.accn)
 Lib.estimate,os.time=saved_estimate,saved_time
 check(yields-before_yields==1 and not plugin.sec_busy,"one thousand local checks do not incur one thousand 100ms UI waits")
+check(find(plugin:getSubMenuItems(),"存储与清理"),"main menu exposes explicit storage management")
+assert(os.remove(r.original_path)); assert(os.remove(r.chinese_path))
+local storage=plugin:getStorageItems()
+check(find(storage,"检查到") and find(plugin:getLocalTranslationItems(),"文件位置待核对"),"external removal is discovered without displaying phantom pending translation")
+local identity=r.paths.cik .. ":" .. r.paths.accn
+local settings_before=saves; local requests_before=calls
+plugin:prepareCleanup({identity},{remove_reading_data=true})
+local cleanup=shown[#shown]
+check(cleanup.kind=="confirmbox" and cleanup.text:find("不可撤销",1,true) and Files.fileExists(r.paths.source),"cleanup confirmation is inert and clearly names destructive action")
+plugin.ui.document={file="another-open-book.epub"}
+cleanup.ok_callback()
+check(Files.fileExists(r.paths.source) and not plugin.sec_busy,"opening a book after confirmation blocks removal and releases busy flag")
+plugin.ui.document=nil
+plugin:prepareCleanup({identity},{remove_reading_data=true}); cleanup=shown[#shown]
+cleanup.ok_callback(); cleanup.ok_callback()
+check(not Files.fileExists(r.paths.source) and not plugin.sec_busy and saves==settings_before and calls==requests_before,"confirmed cleanup runs once, without API, settings or watchlist writes")
 print(string.format("real main/translation UI: %d checks passed; widgets/network are offline adapters",n))

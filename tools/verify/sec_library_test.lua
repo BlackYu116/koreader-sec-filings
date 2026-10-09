@@ -124,8 +124,8 @@ local attack,ar,amake=setup("cache-link")
 assert(attack:translate(ar.paths.cik,ar.paths.accn,amake()))
 local cache_file
 local lfs=require("libs/libkoreader-lfs")
-for name in lfs.dir(attack.work_dir .. "/translation-cache") do
-    if name:match("%.cache$") then cache_file=attack.work_dir .. "/translation-cache/" .. name; break end
+for name in lfs.dir(ar.paths.dir .. "/translation-cache") do
+    if name:match("%.cache$") then cache_file=ar.paths.dir .. "/translation-cache/" .. name; break end
 end
 local sentinel=root .. "/sentinel.txt"; write(sentinel,"must-not-change")
 assert(os.rename(cache_file,cache_file .. ".backup"))
@@ -154,4 +154,28 @@ local linked=Library:new{work_dir=root .. "/safe-work",out_dir=root .. "/unsafe-
 assert(Files.ensureDir(linked.out_dir))
 assert(os.execute("ln -s " .. q(pub.out_dir) .. " " .. q(linked.out_dir .. "/" .. Filing.companyDir(co)))==0)
 check(not linked:validateTargets(co,filing),"company output symlink refused before file operations")
+-- Upgrade: previous global cache is read-only during estimate and copied only at execution.
+local migrated,mr,mmake=setup("legacy-cache")
+assert(migrated:translate(mr.paths.cik,mr.paths.accn,mmake()))
+assert(os.remove(mr.chinese_path))
+local scoped=mr.paths.dir .. "/translation-cache"
+local shared=migrated.work_dir .. "/translation-cache"
+assert(os.rename(scoped,shared))
+before=calls
+stats=assert(migrated:estimate(mr.paths.cik,mr.paths.accn,mmake()))
+check(stats.requests==0 and stats.cache_hits==3 and not Files.fileExists(scoped) and calls==before,"old shared cache preflight is read-only and free")
+assert(migrated:translate(mr.paths.cik,mr.paths.accn,mmake{translation_cache_only=true,deepseek_api_key=""}))
+check(Files.fileExists(shared) and Files.fileExists(scoped) and calls==before,"execution copies validated legacy hits into filing-owned cache without deleting global cache")
+local co2={cik=320193,name="苹果"}
+local fi2={form="10-Q",date="2026-10-02",accn="0000320193-26-000009"}
+write(Filing.outputPath(migrated.out_dir,co2,fi2,"en"),"other original")
+local second=assert(migrated:register(co2,fi2,{title="Other",chapters={{id="one",html="<p>Revenue 10.</p>"}}}))
+local mt=mmake{translation_cache_only=true,deepseek_api_key=""}
+assert(migrated:translate(second.paths.cik,second.paths.accn,mt))
+check(mt.cache_dir==second.paths.dir .. "/translation-cache" and mt.cache_dir~=scoped and calls==before,"two filings independently own reused legacy blocks")
+local lifecycle=require("sec_lifecycle"):new{work_dir=migrated.work_dir,out_dir=migrated.out_dir}
+local deletion=assert(lifecycle:preview({mr.paths.cik .. ":" .. mr.paths.accn},{remove_books=true}))
+assert(lifecycle:execute(deletion))
+check(not Files.fileExists(scoped) and Files.fileExists(mt.cache_dir) and Files.fileExists(second.chinese_path)
+    and Files.fileExists(shared) and calls==before,"deleting one completed filing leaves another filing and legacy shared cache intact")
 print(string.format("library: %d checks passed; API and EPUB writer are offline spies",count))

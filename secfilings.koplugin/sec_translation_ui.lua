@@ -152,10 +152,13 @@ function TranslationUI:getLocalTranslationItems(page)
     local first = (page - 1) * 15 + 1
     for i = first, math.min(first + 14, #entries) do
         local entry = entries[i]
+        local label = labels[entry.status]
+        if not entry.original_present then
+            label = entry.chinese_present and _("仅中文版在原位置") or _("文件位置待核对")
+        elseif entry.status == "complete" and not entry.chinese_present then label = _("中文版已移除或移动") end
         items[#items+1] = {text=string.format("%s · %s · %s · %s", entry.name,
-            entry.form, entry.date, labels[entry.status]),
-            help_text=entry.accn,
-            callback=function() self:prepareTranslation(entry.cik, entry.accn) end}
+            entry.form, entry.date, label), help_text=entry.accn,
+            sub_item_table_func=function() return self:getLocalFilingActions(entry) end}
     end
     if first + 15 <= #entries then
         items[#items+1] = {text=_("下一页"),

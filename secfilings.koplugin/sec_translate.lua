@@ -89,6 +89,7 @@ function Translate:new(opts)
     inst.max_output_tokens = math.max(64, limit(opts.max_output_tokens, 4096, 8192))
     inst.max_response_bytes = 262144
     inst.cache_dir = opts.cache_dir
+    inst.legacy_cache_dir = opts.legacy_cache_dir -- read-only migration source; never cleared with a filing
     inst.cache_only = opts.cache_only == true
     inst.transport = opts.transport -- offline tests only; returns content, error
     inst.request_count, inst.input_bytes, inst.cache_hits = 0, 0, 0
@@ -212,6 +213,22 @@ function Translate:translateText(text, progress_cb)
         local cached = readCache(self, path, key)
         local restored = cached and validate(cached, tokens)
         if restored then self.cache_hits = self.cache_hits + 1; return leading .. restored .. trailing end
+        if self.legacy_cache_dir then
+            local legacy = setmetatable({cache_dir=self.legacy_cache_dir}, {__index=self})
+            local old_path, old_key = cachePath(legacy, text)
+            if not old_path and old_key then return nil, old_key end
+            local old = old_path and readCache(self, old_path, old_key)
+            local reused = old and validate(old, tokens)
+            if reused then
+                -- Planning is strictly read-only; execution promotes a validated old hit locally.
+                if not self.estimate_seen then
+                    local saved, err = writeCache(path, key, old)
+                    if not saved then return nil, err end
+                end
+                self.cache_hits = self.cache_hits + 1
+                return leading .. reused .. trailing
+            end
+        end
     end
     -- Read-only planning follows exactly the same splitting/cache validation path.
     if self.estimate_seen then

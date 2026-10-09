@@ -254,6 +254,12 @@ function SecFilings:getSubMenuItems()
     }
 
     items[#items + 1] = {
+        text = _("存储与清理"),
+        help_text = _("检查删书后的附属资料；只在确认后删除，不影响设置和关注列表。"),
+        sub_item_table_func = function() return self:getStorageItems() end,
+    }
+
+    items[#items + 1] = {
         text = _("下载某一家"),
         sub_item_table_func = function()
             local sub = {}
@@ -290,8 +296,8 @@ function SecFilings:getSubMenuItems()
     }
 
     items[#items + 1] = {
-        text = _("版本 0.2.0 · 升级说明"),
-        callback = function() self:showMessage(_("原有合集和阅读进度已保留。新版每份申报单独成书，首次会下载最近几份。中文从「已有原文」生成；旧合集不自动翻译。")) end,
+        text = _("版本 0.2.1 · 清理说明"),
+        callback = function() self:showMessage(_("删书后打开「存储与清理」检查残留，确认后清理。不后台静默删除，不清空其他书的缓存或关注列表。")) end,
     }
     return items
 end
@@ -1205,5 +1211,6 @@ function SecFilings:openFolder()
 end
 
 for name, method in pairs(require("sec_translation_ui")) do SecFilings[name] = method end
+for name, method in pairs(require("sec_storage_ui")) do SecFilings[name] = method end
 
 return SecFilings

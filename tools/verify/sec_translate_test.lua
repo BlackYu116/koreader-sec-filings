@@ -103,6 +103,18 @@ check(partial:translateHtml(long) == nil and partial.request_count == 1, "interr
 local continued = new({cache_dir=cache_dir,max_chars=12})
 check(continued:translateHtml(long) == long:gsub("Revenue","营收") and continued.cache_hits == 1, "resumed document uses completed block")
 
+-- Legacy read-through remains free and read-only until an explicit execution.
+local owned=cache_dir .. "/owned-not-created"
+local migration=new({cache_dir=owned,legacy_cache_dir=cache_dir,cache_only=true,api_key=""})
+local estimate=assert(migration:estimate({{html="<p>Revenue 10</p>"}}))
+check(estimate.requests==0 and estimate.cache_hits==1 and not require("libs/libkoreader-lfs").attributes(owned), "legacy estimate never creates the filing cache")
+local moved,migration_error=migration:translateText("Revenue 10")
+check(not moved and migration.request_count==0 and migration_error:find("缓存",1,true), "legacy promotion disk failure makes no paid request")
+local changed=new({cache_dir=owned,legacy_cache_dir=cache_dir,cache_only=true,model="different"})
+check(changed:translateText("Revenue 10")==nil and changed.request_count==0, "legacy cache remains separated by model")
+assert(require("sec_watchlist").ensureDir(owned))
+check(migration:translateText("Revenue 10")=="营收 10" and migration.request_count==0, "legacy promotion retries into an existing filing directory without a key")
+
 -- Exercise production _request with fake wire I/O, not a substitute translation engine.
 local payload, wire, response, status, bad_json
 local http = {TIMEOUT=17}

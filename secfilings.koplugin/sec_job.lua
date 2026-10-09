@@ -768,10 +768,7 @@ local function runSingleFilings(companies, opts, progress_cb)
     local ok_dir, dir_err = SecJob.ensureDir(run_opts.out_dir)
     if not ok_dir then return results, { dir_err }, info end
     if run_opts.fetch_images then SecJob.ensureDir(run_opts.work_dir) end
-    if translator then
-        local cache_ok, cache_err = SecJob.ensureDir(translator.cache_dir)
-        if not cache_ok then return results, { cache_err }, info end
-    end
+    -- Per-filing cache directories are created by Library:translate only after verification.
     local translation_files = 0
     local max_translation_files = math.max(0, math.min(10,
         math.floor(tonumber(opts.translation_max_files) or 1)))

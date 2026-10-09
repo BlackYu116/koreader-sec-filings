@@ -182,11 +182,23 @@ local function assetDirectory(p, source)
 end
 function Library:translator(opts)
     opts = opts or {}
-    return Translate:new{api_key=opts.deepseek_api_key, endpoint=opts.deepseek_endpoint,
+    local translator = Translate:new{api_key=opts.deepseek_api_key, endpoint=opts.deepseek_endpoint,
         model=opts.deepseek_model, thinking=opts.deepseek_thinking, max_chars=opts.deepseek_chunk_chars,
-        timeout=opts.deepseek_timeout, cache_dir=self.work_dir .. "/translation-cache",
+        timeout=opts.deepseek_timeout,
         cache_only=opts.translation_cache_only, max_requests=opts.translation_max_requests,
         max_input_bytes=opts.translation_max_input_bytes}
+    translator.library_cache_root = self.work_dir
+    return translator
+end
+-- Bind each operation to its filing; preserve counters across a bounded batch.
+-- This mutates only the translator object, never creates directories during estimate.
+function Library:bindTranslator(translator, p)
+    if translator.library_cache_root ~= self.work_dir then return nil, "翻译器与资料目录不一致" end
+    local cache = p.dir .. "/translation-cache"
+    local legacy = self.work_dir .. "/translation-cache"
+    if not safePath(cache) or not safePath(legacy) then return nil, "翻译缓存目录无效或包含链接" end
+    translator.cache_dir, translator.legacy_cache_dir = cache, legacy
+    return true
 end
 local function validSource(s, p)
     if type(s) ~= "table" or s.schema ~= 1 or type(s.company) ~= "table" or type(s.filing) ~= "table"
@@ -195,7 +207,18 @@ local function validSource(s, p)
             or not Files.isValidDate(s.filing.date) or type(s.assets) ~= "table"
             or type(s.original_hash) ~= "string" or #s.original_hash ~= 64 then return nil end
     local cik, accn = identity(s.company.cik, s.filing.accn)
-    return cik == p.cik and accn == p.accn and assetDirectory(p, s) and normalizedBook(s.book)
+    local book = normalizedBook(s.book)
+    if cik ~= p.cik or accn ~= p.accn or not assetDirectory(p, s) or not book
+            or not s.original_hash:match("^[a-f0-9]+$") then return nil end
+    local expected = {}
+    for i = 1, #book.images do expected[book.images[i].href] = true end
+    if book.cover then expected[book.cover.href] = true end
+    for href, hash in pairs(s.assets) do
+        if type(href) ~= "string" or not expected[href] or type(hash) ~= "string"
+                or #hash ~= 64 or not hash:match("^[a-f0-9]+$") then return nil end
+    end
+    for href in pairs(expected) do if not s.assets[href] then return nil end end
+    return book
 end
 function Library:saveState(p, state)
     return atomic(p.state, json.encode(state))
@@ -244,7 +267,7 @@ function Library:register(company, filing, book, staged)
         filing={accn=p.accn, form=filing.form, date=filing.date}, book=clean, assets={}, asset_set=asset_set}
     local original = Filing.outputPath(self.out_dir, source.company, source.filing, "en")
     source.original_hash = hashFile(staged and original .. ".building.epub" or original)
-    if not validSource(source, p) then return nil, "原文未完成或元数据无效，未登记续译" end
+    if not source.original_hash then return nil, "原文未完成，未登记续译" end
     local images = {}; for i = 1, #clean.images do images[#images+1] = clean.images[i] end
     if clean.cover then images[#images+1] = clean.cover end
     for i = 1, #images do
@@ -253,6 +276,7 @@ function Library:register(company, filing, book, staged)
         if not hash then return nil, "图片素材缺失，未登记续译" end
         source.assets[href] = hash
     end
+    if not validSource(source, p) then return nil, "原文元数据无效，未登记续译" end
     local raw = json.encode(source)
     if #raw > MAX_SOURCE then return nil, "原文快照超过 32 MiB 上限" end
     local ok; ok, err = Files.ensureDir(p.dir); if not ok then return nil, err end
@@ -314,6 +338,7 @@ end
 function Library:estimate(cik, accn, translator, progress_cb)
     local record, err = self:load(cik, accn); if not record then return nil, err end
     local ok; ok, err = self:verify(record); if not ok then return nil, err end
+    ok, err = self:bindTranslator(translator, record.paths); if not ok then return nil, err end
     local stats; stats, err = translator:estimate(record.book.chapters, progress_cb)
     if not stats then return nil, err end
     stats.status = record.state.status
@@ -327,6 +352,7 @@ function Library:translate(cik, accn, translator, progress_cb)
     if translator.expected_source_hash and translator.expected_source_hash ~= r.state.source_hash then
         return nil, "原文快照已变化，请重新确认翻译"
     end
+    ok, err = self:bindTranslator(translator, r.paths); if not ok then return nil, err end
     local fingerprint = translator:fingerprint()
     local state = r.state
     -- Recovery also covers a crash after rename but before the final state commit.
@@ -342,7 +368,7 @@ function Library:translate(cik, accn, translator, progress_cb)
     if progress_cb and progress_cb("正在翻译 " .. r.source.filing.form .. " " .. r.source.filing.date) == false then
         return nil, "已取消"
     end
-    local cache = self.work_dir .. "/translation-cache"
+    local cache = r.paths.dir .. "/translation-cache"
     if not safePath(cache) or translator.cache_dir ~= cache then return nil, "翻译缓存目录无效" end
     ok, err = Files.ensureDir(cache); if not ok then return nil, err end
     state.status, state.fingerprint = "translating", fingerprint
@@ -414,8 +440,13 @@ function Library:list()
                             and type(filing.form) == "string" and Files.isValidDate(filing.date)
                             and identity(company.cik, filing.accn) == cik and filing.accn == accn
                         if valid then
+                            local en = Filing.outputPath(self.out_dir, company, filing, "en")
+                            local zh = Filing.outputPath(self.out_dir, company, filing, "zh")
+                            local en_ok = safePath(en) and lfs.symlinkattributes(en, "mode") == "file" or false
+                            local zh_ok = safePath(zh) and lfs.symlinkattributes(zh, "mode") == "file" or false
                             out[#out+1] = {cik=cik, accn=accn, name=company.name,
-                                form=filing.form, date=filing.date, status=summary.status}
+                                form=filing.form, date=filing.date, status=summary.status,
+                                original_present=en_ok, chinese_present=zh_ok}
                         else damaged = damaged + 1 end
                         if #out + damaged >= 1000 then return out, damaged, true end
                     end
