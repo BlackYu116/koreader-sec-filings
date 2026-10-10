@@ -416,6 +416,8 @@ end
 --- 一个 font 标签 —— 「表现层残留为 0」这条验收因此一直没真正达标。
 local function dropTag(s, name)
     local p = ci(name)
+    -- Every removal below requires this prefix. Keep all original patterns.
+    if not s:find("<%s*/?%s*" .. p .. "[%s>/]") then return s end
     s = s:gsub("<%s*/?%s*" .. p .. "%s*>", "")
     s = s:gsub("<%s*/?%s*" .. p .. "%s[^>]*>", "")
     s = s:gsub("<%s*" .. p .. "%s*/>", "")
@@ -435,10 +437,14 @@ local VOID_TAGS = { "br", "hr", "col", "area", "base", "embed", "source",
 local function selfCloseVoid(s)
     for _vi, void in ipairs(VOID_TAGS) do
         local p = ci(void)
-        -- 先抹掉原有斜杠，否则 <br /> 会被后面两遍变成 <br //>
-        s = s:gsub("(<%s*" .. p .. "%s[^>]-)/%s*>", "%1>")
-        s = s:gsub("<%s*" .. p .. "%s*>", "<" .. void .. "/>")
-        s = s:gsub("(<%s*" .. p .. "%s[^>]-)>", "%1/>")
+        -- No replacement can match without this tag prefix. Avoid three
+        -- full-document replacement buffers when the void tag is absent.
+        if s:find("<%s*" .. p .. "[%s>]") then
+            -- 先抹掉原有斜杠，否则 <br /> 会被后面两遍变成 <br //>
+            s = s:gsub("(<%s*" .. p .. "%s[^>]-)/%s*>", "%1>")
+            s = s:gsub("<%s*" .. p .. "%s*>", "<" .. void .. "/>")
+            s = s:gsub("(<%s*" .. p .. "%s[^>]-)>", "%1/>")
+        end
     end
     return s
 end
@@ -1349,9 +1355,17 @@ local function renderChunk(grid, nrows, chunk)
 end
 
 --- 数一张表片段里出现了几个 <table（大小写不敏感，含所有嵌套层）
+local function countMatches(s, pattern)
+    local n, pos = 0, 1
+    while true do
+        local first, last = s:find(pattern, pos)
+        if not first then return n end
+        n, pos = n + 1, last + 1
+    end
+end
+
 local function countTables(s)
-    local _, n = s:gsub("<[Tt][Aa][Bb][Ll][Ee][%s>]", "")
-    return n
+    return countMatches(s, "<[Tt][Aa][Bb][Ll][Ee][%s>]")
 end
 
 --- 处理一段 HTML 里的所有表格：排不下的拆成若干张窄表，排得下的原样保留。
@@ -1470,7 +1484,9 @@ function SecSource:splitWideTables(s, stats, depth)
                     stats.collapsed = stats.collapsed + 1
                 end
             else
-                if depth < 3 then
+                -- A leaf table has no children to process. Re-entering the same
+                -- fragment used to parse every narrow table four times.
+                if depth < 3 and countTables(frag) > 1 then
                     out[#out + 1] = self:splitWideTables(frag, stats, depth + 1)
                 else
                     out[#out + 1] = frag
@@ -1608,6 +1624,9 @@ SecSource._plainTextForTest = nil
 
 function SecSource:cleanHtml(raw)
     local s = raw
+    -- The job transfers ownership of the raw response. Do not pin that original
+    -- string in a second parameter slot throughout every transformation.
+    raw = nil
     local info = { images = 0 }
 
     -- 1) BOM / XML 声明 / DOCTYPE
@@ -1657,8 +1676,8 @@ function SecSource:cleanHtml(raw)
     -- 属性不动：src / alt 由 9.5 的 stripPresentation 保留，
     -- sec_images 要靠原始 src 去拼图片 URL，删了就没法抓。
     do
-        local _, n_bare = s:gsub("<%s*[Ii][Mm][Gg]%s*>", "")
-        local _, n_attr = s:gsub("<%s*[Ii][Mm][Gg][%s][^>]*>", "")
+        local n_bare = countMatches(s, "<%s*[Ii][Mm][Gg]%s*>")
+        local n_attr = countMatches(s, "<%s*[Ii][Mm][Gg][%s][^>]*>")
         if self.drop_images then
             s = s:gsub("<%s*[Ii][Mm][Gg]%s*>", "")
             s = s:gsub("<%s*[Ii][Mm][Gg][%s][^>]*>", "")

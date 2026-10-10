@@ -940,7 +940,20 @@ function SecWatchlist.save(wl, target, opts)
     if settings then
         settings.data[opts.key or "sec_watchlist"] = payload
         if type(settings.flush) == "function" then
-            settings:flush()
+            local flushed, flush_err = settings:flush()
+            if flushed == false or (flushed == nil and flush_err ~= nil) then
+                return nil, tostring(flush_err or "设置写入失败")
+            end
+        end
+        -- KOReader LuaSettings:flush returns self even if util.writeToFile
+        -- cannot open the file. Verify only our watchlist payload, never log
+        -- the surrounding settings (which may contain credentials).
+        if type(settings.file) == "string" then
+            local stored = loadTableFile(settings.file)
+            if not stored or SecWatchlist.serialize(stored[opts.key or "sec_watchlist"])
+                    ~= SecWatchlist.serialize(payload) then
+                return nil, "设置写后校验失败，下载进度尚未确认落盘"
+            end
         end
         wl.load_path = nil
         wl.settings = settings

@@ -31,6 +31,15 @@ package.loaded["sec_source"]={companies={{cik=320193,name="苹果"}},table_width
 package.loaded["sec_search"]={}
 package.loaded["sec_images"]={}
 package.loaded["sec_metrics"]={}
+package.loaded["pluginshare"]={}
+package.loaded["device"]={isKindle=function() return false end}
+local activity, scheduled = 0, {}
+package.loaded["pluginloader"]={getPluginInstance=function(self,name)
+    assert(name=="autosuspend")
+    return {onInputEvent=function() activity=activity+1 end}
+end}
+package.loaded["ui/uimanager"].scheduleIn=function(self,delay,callback) scheduled[callback]=delay end
+package.loaded["ui/uimanager"].unschedule=function(self,callback) scheduled[callback]=nil end
 package.loaded["sec_epub"]={write=function(self,path,book)
     local f=assert(io.open(path,"wb")); f:write(book.chapters[1].html); f:close(); return true
 end}
@@ -107,6 +116,97 @@ plugin:startDownload({co},{translate=true})
 check(downloads==0,"old download entry cannot bypass translation confirmation")
 plugin:startDownload({co})
 check(downloads==1 and not plugin.sec_busy,"normal download wrapper still works")
+local Share=package.loaded["pluginshare"]
+plugin.runJob=function(self)
+    check(Share.pause_auto_suspend==true,"active download pauses automatic suspend")
+    local pulse=next(scheduled)
+    local last=activity
+    assert(pulse and scheduled[pulse]==60);pulse()
+    check(activity==last+1,"Kindle idle clock is refreshed without synthetic input")
+    package.loaded["ui/trapper"]:info("yield probe")
+    self:onSuspend()
+    check(self.sec_download_cancelled,"manual suspend requests safe cancellation")
+    last=activity;pulse()
+    check(activity==last,"manual suspend stops keep-awake activity")
+    error("injected job failure")
+end
+plugin:startDownload({co})
+check(not plugin.sec_busy and Share.pause_auto_suspend==nil and not plugin.sec_download_active and next(scheduled)==nil,"yielding failure releases busy, timer and suspend guard")
+Share.pause_auto_suspend=true
+plugin.runJob=function() end
+plugin:startDownload({co})
+check(Share.pause_auto_suspend==true,"pre-existing suspend pause remains owned by its caller")
+Share.pause_auto_suspend=nil
+local Job=require("sec_job")
+local real_job=Job.run
+local real_flush=store.flush
+store.flush=function() return false,"disk full fixture" end
+local saved,save_err=plugin:jobOpts({co}).on_filing_committed({})
+check(not saved and save_err=="disk full fixture","real checkpoint propagates settings flush failure")
+store.flush=function(self) return self end
+store.file=root .. "/silent-settings.lua"
+local silent=assert(io.open(store.file,"wb"));silent:write("return {}\n");silent:close()
+saved,save_err=plugin:jobOpts({co}).on_filing_committed({})
+check(not saved and save_err:find("写后校验",1,true),"write-back verification detects native-style silent flush failure")
+store.flush=function(self)
+    local file=assert(io.open(self.file,"wb"));file:write(Files.serialize(self.data));file:close();return self
+end
+check(plugin:jobOpts({co}).on_filing_committed({}),"checkpoint verifies only its persisted settings payload")
+store.flush=real_flush;store.file=nil
+Job.run=function(companies,opts,progress)
+    plugin:onSuspend()
+    check(progress("sleep fixture")==false,"real progress callback cancels after manual suspend")
+    return {},{},{cancelled=true}
+end
+plugin.runJob=Main.runJob
+plugin:startDownload({co})
+Job.run=real_job
+check(not plugin.sec_busy and not Share.pause_auto_suspend,"normal suspend cancellation releases runtime guard")
+local loader=package.loaded["pluginloader"]
+local real_loader=loader.getPluginInstance
+local dispatched=false
+loader.getPluginInstance=function() error("heartbeat startup failure") end
+plugin.runJob=function() dispatched=true end
+plugin:startDownload({co})
+check(not dispatched and not plugin.sec_busy and not Share.pause_auto_suspend and next(scheduled)==nil,"startup heartbeat failure leaves no work, lock or timer")
+loader.getPluginInstance=real_loader
+plugin.runJob=function(self)
+    local pulse=assert(next(scheduled))
+    loader.getPluginInstance=function() error("heartbeat timer failure") end
+    pulse()
+    check(self.sec_download_cancelled and self.sec_busy and not Share.pause_auto_suspend and next(scheduled)==nil,"timer failure requests cancellation without unlocking a live job")
+    loader.getPluginInstance=real_loader
+end
+plugin:startDownload({co})
+check(not plugin.sec_busy and not plugin.sec_download_active and next(scheduled)==nil,"timer failure releases task state at safe completion")
+-- Kindle path through the real wrapper, with disabled/missing AutoSuspend.
+local device=package.loaded["device"]
+local clock,resets=0,0
+local power={getPowerdState=function() return "active" end,isCharging=function() return false end,
+    isCharged=function() return false end,resetT1Timeout=function() resets=resets+1 end,
+    lipc_handle={get_int_property=function() return 0 end}}
+device.isKindle=function() return true end;device.getPowerDevice=function() return power end
+package.loaded["ui/time"]={to_number=function(t) return t end}
+package.loaded["ui/uimanager"].getElapsedTimeSinceBoot=function() return clock end
+local disabled_auto={auto_suspend_timeout_seconds=-1,onInputEvent=function() end}
+loader.getPluginInstance=function() return disabled_auto end
+plugin.runJob=function(self)
+    check(resets==1 and disabled_auto.last_t1_reset_time==0,"disabled AutoSuspend still receives native protection without timeout mutation")
+    clock=240;assert(next(scheduled))()
+    check(resets==2 and disabled_auto.last_t1_reset_time==240 and disabled_auto.auto_suspend_timeout_seconds==-1,"native renewal updates upstream clock but preserves user setting")
+    self:onSuspend();clock=480;assert(next(scheduled))()
+    check(resets==2,"manual suspend prevents native timer renewal")
+end
+plugin:startDownload({co})
+check(next(scheduled)==nil and not Share.pause_auto_suspend,"Kindle completion releases renewal timer")
+loader.getPluginInstance=function() return nil end
+plugin.runJob=function() check(resets==3,"missing AutoSuspend instance still has native protection") end
+plugin:startDownload({co})
+power.lipc_handle.get_int_property=function() error("powerd read failed") end
+local ran=false;plugin.runJob=function() ran=true end
+plugin:startDownload({co})
+check(not ran and not plugin.sec_busy and not Share.pause_auto_suspend and next(scheduled)==nil,"native startup error prevents download and restores state")
+loader.getPluginInstance=real_loader;device.isKindle=function() return false end
 plugin:showMessage(string.rep("中",100))
 check(not shown[#shown].text:find("\239\191\189",1,true) and #shown[#shown].text % 3==0,"long result truncation keeps UTF-8 boundaries")
 local selected_opts

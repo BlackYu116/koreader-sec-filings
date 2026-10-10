@@ -1,12 +1,22 @@
 # KOReader SEC Filings — SEC 研习室
 
-**Version 0.2.2** · [中文使用说明](README.zh-CN.md)
+**Version 0.2.4** · [中文使用说明](README.zh-CN.md)
 
-> Version 0.2.2 was backed up, installed and loaded through a normal KOReader restart on the test Kindle on 2026-10-09. All 26 installed files match the source and local package; protected settings and SEC data are unchanged. See [deployment and validation limits](docs/DEPLOYMENT-0.2.2.md). This source revision contains 0.2.2; no GitHub Release or tag was created.
+> Version 0.2.4 is installed and loaded on the test Kindle. Short lock/wake and touch recovery passed; 27 installed files match the package and 310 protected files are unchanged. Real-crengine isolated tests reduced median cleaning time from 84.87 to 58.43 seconds and peak RSS from 99.68 to 83.66 MiB with identical output. These are not full-batch ReaderUI measurements or long-hibernation validation. See [deployment and limits](docs/DEPLOYMENT-0.2.4.md). No GitHub Release or tag was created.
 
 Read SEC EDGAR filings as local EPUBs in KOReader. Download an individual filing, preserve its source snapshot, and optionally produce a separate Chinese edition using your own DeepSeek account. No AI-assistant plugin is required.
 
-## New in 0.2.2: recovery and search
+## New in 0.2.3–0.2.4: download reliability
+
+- Reuse successful company metrics within one batch and checkpoint completed filings individually.
+- Preserve cancellation through image fetching and release temporary power protection on completion or failure.
+- Renew Kindle's native idle timer safely even when AutoSuspend is disabled, without permanently inhibiting manual sleep.
+- Skip redundant HTML scans and transfer raw-response ownership to reduce retained memory without dropping text, tables or images.
+- An optional Special Offers screensaver companion is in `contrib/kindle/`; it requires separate backup and installation, not automatic plugin installation.
+
+Completed originals are reusable, but **0.2.4 does not yet persist a fixed retry queue**. Missing books with old download history are not silently redownloaded; a history-without-baseline retry can still backfill older filings. Fixed queues and complete production-batch measurements are follow-up work. The menu's version label still says 0.2.3; package metadata identifies 0.2.4.
+
+## Earlier in 0.2.2: recovery and search
 
 The `feat/recovery-location-search` branch adds explicit offline original reconstruction, hash-verified relinking within the configured SEC library, and an immediate search-results panel. These additions are installed on the test Kindle as 0.2.2.
 

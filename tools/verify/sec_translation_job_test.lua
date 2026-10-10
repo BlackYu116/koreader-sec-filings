@@ -8,11 +8,18 @@ local filings = {
     {form="8-K", date="2026-10-02", accn="0001318605-26-000002"},
 }
 function source:recentFilings() return filings end
+local returned_content, handoffs
+handoffs=0
 function source:filingContent(cik, filing)
-    return { html="<p>" .. string.rep("Revenue 10 rose. ",20) .. "</p>",
+    returned_content = { html="<p>" .. string.rep("Revenue 10 rose. ",20) .. "</p>",
         why="offline fixture", url="https://www.sec.gov/fixture" }
+    return returned_content
 end
-function source:cleanHtml(html) return html,{images=0} end
+function source:cleanHtml(html)
+    assert(type(html)=="string" and returned_content.html==nil,"raw ownership must transfer before cleaning")
+    handoffs=handoffs+1
+    return html,{images=0}
+end
 package.loaded["sec_source"] = source
 package.loaded["sec_images"] = {}
 package.loaded["sec_metrics"] = {}
@@ -38,6 +45,7 @@ end
 local companies={{cik=1318605,name="特斯拉"}}
 local r,e,info=Job.run(companies,options("first"))
 check(#r==2 and #e==0,"two original filings complete")
+check(handoffs==2,"raw HTML ownership transfers before cleaner, without changing its string API")
 check(r[1].chinese_path and not r[2].chinese_path and #books==3,"default one translated filing cap")
 check(#r[2].warnings==1,"file cap is visible in warnings")
 check(calls==1,"one real translator dispatch through fake wire")
@@ -95,4 +103,48 @@ source.recentFilings=saved_recent
 check(#one==1 and #one_errors==0 and one[1].accession==filings[1].accn,"explicit search download selects exactly one accession even before baseline")
 check(Files.find(wl,1318605).seen_upto_date=="2026-10-02","explicit historical download never changes incremental baseline")
 check(books[#books].book.identifier:find(filings[1].accn,1,true),"original EPUB gets stable filing identifier")
+local metric_calls=0
+local Metrics=package.loaded["sec_metrics"]
+Metrics.collectConcepts=function(company,opts,progress)
+    metric_calls=metric_calls+1
+    if not progress("fixture metrics") then return false,nil,"cancelled" end
+    return true,{ok_count=1,metrics={{}},as_of="2026-10-01"}
+end
+Metrics.buildChapter=function() return true,"<p>Latest company snapshot 10.</p>" end
+local mc=options("metrics-cache"); mc.translate=false; mc.metrics_chapter=true
+local mr,me=Job.run(companies,mc)
+check(#mr==2 and #me==0 and metric_calls==1,"same company metrics fetched once per batch")
+check(mr[1].metrics and mr[2].metrics,"cached metrics retained in both filings")
+local fresh=options("metrics-new-run"); fresh.translate=false; fresh.metrics_chapter=true
+Job.run(companies,fresh)
+check(metric_calls==2,"new batch refreshes metrics")
+local checkpoint_wl=Files.new({seed_defaults=false})
+assert(Files.add(checkpoint_wl,{cik=1318605,name="特斯拉",forms={"8-K"}}))
+local cp=options("checkpoints"); cp.translate=false; cp.watchlist=checkpoint_wl
+local checkpoints={}
+cp.on_filing_committed=function(result)
+    local seen=Files.find(checkpoint_wl,1318605).seen
+    checkpoints[#checkpoints+1]=#seen
+    assert(Files.fileExists(result.path),"checkpoint before original commit")
+    return true
+end
+local cpr,cpe=Job.run(companies,cp)
+check(#cpr==2 and #cpe==0 and checkpoints[1]==1 and checkpoints[2]==2,"each committed original checkpoints seen immediately")
+local failed_cp=options("failed-checkpoint"); failed_cp.translate=false; failed_cp.watchlist=Files.new({seed_defaults=false})
+assert(Files.add(failed_cp.watchlist,{cik=1318605,name="特斯拉",forms={"8-K"}}))
+failed_cp.on_filing_committed=function() return false,"disk failure" end
+local fcr,fce,fci=Job.run(companies,failed_cp)
+check(#fcr==1 and #fce>0 and fci.cancelled,"checkpoint failure stops remaining work without losing committed original")
+local clean_before=source.cleanHtml
+source.cleanHtml=function() error("cancelled clean ran") end
+local cancel_clean=options("cancel-before-clean"); cancel_clean.translate=false
+local ccr,cce,cci=Job.run(companies,cancel_clean,function(msg) return not msg:find("正在清洗",1,true) end)
+source.cleanHtml=clean_before
+check(#ccr==0 and cci.cancelled,"cancel between fetch and clean prevents CPU-heavy conversion")
+local metric_cancel=options("metric-cancel"); metric_cancel.translate=false; metric_cancel.metrics_chapter=true
+local content_before=source.filingContent
+source.filingContent=function() error("cancelled metrics must not fetch body") end
+local mcr,mce,mci=Job.run(companies,metric_cancel,function(msg) return msg~="fixture metrics" end)
+source.filingContent=content_before
+check(#mcr==0 and mci.cancelled,"cancellation remains sticky after optional metrics stage")
 print(string.format("translation job: %d checks passed; packer/SEC transport are spies",count))

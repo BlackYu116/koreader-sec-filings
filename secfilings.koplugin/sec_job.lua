@@ -506,7 +506,9 @@ local function fetchImages(company, filing, fi, cleaned, base_url, run_opts, ctx
             if not tick(progress_cb, string.format("%s：正在下载图片 %d / %d",
                     company.name, done, total)) then
                 cancelled = true
+                return false
             end
+            return true
         end,
     })
     if not res then
@@ -534,6 +536,7 @@ local function gatherFiling(src, company, filing, fi, run_opts, progress_cb, ctx
         return nil, true
     end
 
+    local fetch_started = os.time()
     local content, cerr = src:filingContent(company.cik, filing)
     if not content then
         ctx.skipped[#ctx.skipped + 1] = string.format("%s %s（%s）",
@@ -541,7 +544,21 @@ local function gatherFiling(src, company, filing, fi, run_opts, progress_cb, ctx
         return nil, false
     end
 
-    local cleaned, cinfo = src:cleanHtml(content.html)
+    logger.info(string.format("secfilings: stage=fetch accession=%s seconds=%d bytes=%d",
+        filing.accn, os.time() - fetch_started, #(content.html or "")))
+    if not tick(progress_cb, string.format("%s：正文已下载，正在清洗与排版 %s %s…",
+            company.name, filing.form, filing.date)) then return nil, true end
+    local clean_started = os.time()
+    -- Transfer, rather than copy/retain, the large raw response. Keep only its
+    -- URL/metadata on content while the cleaner creates intermediate strings.
+    local function takeHtml()
+        local raw = content.html
+        content.html = nil
+        return raw
+    end
+    local cleaned, cinfo = src:cleanHtml(takeHtml())
+    logger.info(string.format("secfilings: stage=clean accession=%s seconds=%d lua_kib=%d",
+        filing.accn, os.time() - clean_started, collectgarbage("count")))
     if not cleaned or #cleaned < 200 then
         -- 清理完短得不像正文，宁可不放，免得书里出现空白章节
         ctx.skipped[#ctx.skipped + 1] = string.format("%s %s（清理后正文过短，已弃用）",
@@ -717,6 +734,13 @@ end
 --------------------------------------------------------------------------
 
 local function runSingleFilings(companies, opts, progress_cb)
+    -- Cancellation is sticky, even when an optional stage returns a soft error.
+    local callback, stopped = progress_cb, false
+    progress_cb = function(message)
+        if stopped then return false end
+        if callback and callback(message) == false then stopped = true end
+        return not stopped
+    end
     local run_opts = {}
     for key, value in pairs(opts) do run_opts[key] = value end
     run_opts.limit = tonumber(opts.limit) or 5
@@ -769,6 +793,9 @@ local function runSingleFilings(companies, opts, progress_cb)
     if not ok_dir then return results, { dir_err }, info end
     if run_opts.fetch_images then SecJob.ensureDir(run_opts.work_dir) end
     -- Per-filing cache directories are created by Library:translate only after verification.
+    -- Cache only the rendered chapter and compact counts, not decoded XBRL history.
+    -- Local to this run: a new batch always gets fresh company metrics.
+    local metrics_cache = {}
     local translation_files = 0
     local max_translation_files = math.max(0, math.min(10,
         math.floor(tonumber(opts.translation_max_files) or 1)))
@@ -801,6 +828,13 @@ local function runSingleFilings(companies, opts, progress_cb)
         if item.update and record then
             item.ok_accns[#item.ok_accns+1] = record.source.filing.accn
             SecWatchlist.markSeen(run_opts.watchlist, item.company.cik, {record.source.filing.accn}, {})
+            if run_opts.on_filing_committed then
+                local saved, save_err = run_opts.on_filing_committed(result)
+                if saved == false or saved == nil then
+                    errors[#errors+1] = "原文已保存，但进度落盘失败；已停止后续下载：" .. tostring(save_err or "保存失败")
+                    return result, true
+                end
+            end
         end
         if translator and record then
             if translation_files >= max_translation_files then
@@ -850,8 +884,18 @@ local function runSingleFilings(companies, opts, progress_cb)
         local work_dir, work_err = library:beginOriginal(company, filing)
         if not work_dir then errors[#errors+1] = work_err; return nil, false end
         run_opts.current_filing_work_dir = work_dir
-        local metrics_ch, metrics_data, metrics_why, metrics_off =
-            metricsChapter(company, run_opts, progress_cb)
+        local metric_key = tostring(company.cik)
+        local cached = metrics_cache[metric_key]
+        local metrics_ch, metrics_data
+        if cached then
+            metrics_ch, metrics_data = cached.chapter, cached.data
+        else
+            metrics_ch, metrics_data = metricsChapter(company, run_opts, progress_cb)
+            if metrics_ch then
+                metrics_data = {ok_count=metrics_data and metrics_data.ok_count or 0}
+                metrics_cache[metric_key] = {chapter=metrics_ch, data=metrics_data}
+            end
+        end
         if metrics_ch then chapters[#chapters + 1] = metrics_ch end
         local chapter, cancelled = gatherFiling(src, company, filing, 1,
             run_opts, progress_cb, ctx)
@@ -880,7 +924,15 @@ local function runSingleFilings(companies, opts, progress_cb)
         }
         local book = original_book
         local path = Filing.outputPath(run_opts.out_dir, company, filing, "en")
+        if not tick(progress_cb, string.format("%s：正在打包与校验 %s %s…",
+                company.name, filing.form, filing.date)) then
+            run_opts.current_filing_work_dir = nil
+            return nil, true
+        end
+        local publish_started = os.time()
         local record, w_err, w_warn = library:publishOriginal(company, filing, book)
+        logger.info(string.format("secfilings: stage=publish accession=%s seconds=%d success=%s",
+            filing.accn, os.time() - publish_started, tostring(record ~= nil)))
         if type(w_warn) == "table" then
             for wi = 1, #w_warn do addWarning(ctx, "打包层：" .. tostring(w_warn[wi])) end
         end
@@ -911,6 +963,8 @@ local function runSingleFilings(companies, opts, progress_cb)
         for fi = 1, #(item.filings or {}) do
             position = position + 1
             local result, cancelled = buildOne(item, item.filings[fi], position)
+            -- Large HTML/JSON temporaries must not accumulate across a batch.
+            collectgarbage("collect")
             if cancelled then
                 recordSeen(run_opts.watchlist, item.update, item.ok_accns, #item.ok_accns > 0, warnings)
                 info.cancelled = true

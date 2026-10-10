@@ -829,8 +829,9 @@ function SecImages:fetchAll(plan, opts)
 
         -- 进度回调放在所有 pcall 之外 —— 它内部可能会 yield（Trapper:info），
         -- 一旦被 pcall 包住，LuaJIT 会直接报 "attempt to yield across a C-call boundary"。
-        if opts.on_progress then
-            opts.on_progress(idx, total, item.src)
+        if opts.on_progress and opts.on_progress(idx, total, item.src) == false then
+            stats.cancelled = true
+            return nil, "cancelled"
         end
 
         local dst = plan.dir_abs .. "/" .. item.id .. ".part"
@@ -1201,7 +1202,8 @@ function SecImages:run(html, base_url, opts)
         item.xml_id = (ns ~= "" and (ns .. "-") or "") .. item.id
     end
 
-    self:fetchAll(plan, opts)
+    local fetched, fetch_err = self:fetchAll(plan, opts)
+    if not fetched then return nil, fetch_err end
 
     local result = {
         html = self:finalize(plan, opts),

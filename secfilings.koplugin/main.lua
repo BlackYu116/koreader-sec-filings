@@ -9,10 +9,9 @@ SEC 研习室 —— 菜单外壳（薄）。
      `for _, f in ipairs(...)`，循环体里的 `_()` 就变成「调用一个数字」（设备实测报
      attempt to call local '_' (a number value)，7 家公司全部下载失败）。
      下面所有循环一律用 ci / fi / si / ei / wi / pi 这类明确变量名。
-  2) 绝不能把 SecJob.run / SecSearch:resolve 包进 pcall。Trapper:info() 内部会
-     coroutine.yield()，而 LuaJIT 不允许跨 pcall 边界 yield；一旦包了，上面那个遮蔽
-     问题修好后会立刻变成 "attempt to yield across a C-call boundary"。
-     错误一律靠返回值给出，外壳只负责展示。
+  2) 进度回调必须允许 coroutine.yield()，不得跨不可续入的 C 回调边界。
+     下载外壳采用与设备原生 Trapper:wrap 相同的 xpcall 清理方式；已在本机与
+     Kindle LuaJIT 验证 yield/resume 后抛错仍能释放任务锁。业务错误仍用返回值。
   3) 结果不能只靠 InfoMessage。设备上 appearance.koplugin 给 InfoMessage:init 打的
      包装有无限递归缺陷（长消息必崩，见交付说明），所以完整结果另外写 logger
      （也就是 crash.log），界面消息自己做长度上限。
@@ -146,7 +145,7 @@ function SecFilings:saveWatchlist()
         logger.warn("secfilings: 关注列表保存失败: " .. tostring(err))
         self:showMessage(T(_("关注列表没能保存：%1"), tostring(err)))
     end
-    return ok
+    return ok, err
 end
 
 --- 首次运行时给关注列表铺 7 家默认公司。
@@ -295,7 +294,7 @@ function SecFilings:getSubMenuItems()
     }
 
     items[#items + 1] = {
-        text = _("版本 0.2.2 · 恢复与清理"),
+        text = _("版本 0.2.3 · 下载与中断保护"),
         callback = function() self:showMessage(_("原文缺失或书籍移动后，在「已有原文」确认恢复或重新关联。删书后打开「存储与清理」检查残留。不后台静默删除，不清空其他书的缓存或关注列表。")) end,
     }
     return items
@@ -893,12 +892,75 @@ function SecFilings:startDownload(companies, override)
     end
     NetworkMgr:runWhenOnline(function()
         if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
+        local PluginShare = require("pluginshare")
+        local previous_pause = PluginShare.pause_auto_suspend
         self.sec_busy = true
+        self.sec_download_active = true
+        self.sec_download_cancelled = false
+        PluginShare.pause_auto_suspend = true
+        -- Software suspend and Kindle powerd have separate timers. Keep the
+        -- native timer alive even when AutoSuspend is disabled, but never
+        -- override charging/KeepAlive safeguards or deliberate manual sleep.
+        local power_guard
+        local keep_awake
+        local released = false
+        local function release_pause()
+            if released then return end
+            released = true
+            if UIManager.unschedule then UIManager:unschedule(keep_awake) end
+            PluginShare.pause_auto_suspend = previous_pause
+        end
+        keep_awake = function()
+            if not self.sec_download_active or self.sec_download_cancelled then return false end
+            -- Timer callbacks are outside the job's xpcall. This non-yielding
+            -- callback needs its own boundary so it cannot crash the UI loop.
+            local ok, err = pcall(function()
+                local loader = require("pluginloader")
+                local autosuspend = loader:getPluginInstance("autosuspend")
+                if autosuspend and autosuspend.onInputEvent then autosuspend:onInputEvent() end
+                power_guard = power_guard or require("sec_download_power"):new(
+                    require("device"), PluginShare, function()
+                        return require("ui/time").to_number(UIManager:getElapsedTimeSinceBoot())
+                    end)
+                local protected, reason = power_guard:pulse()
+                if not protected then error("download power protection: " .. tostring(reason)) end
+                if reason == "reset" and autosuspend then
+                    -- Avoid a second renewal by upstream AutoSuspend this tick.
+                    autosuspend.last_t1_reset_time = UIManager:getElapsedTimeSinceBoot()
+                end
+                if UIManager.scheduleIn then UIManager:scheduleIn(60, keep_awake) end
+            end)
+            if not ok then
+                self.sec_download_cancelled = true
+                release_pause()
+                logger.warn("secfilings: activity heartbeat failed", err)
+            end
+            return ok
+        end
         Trapper:wrap(function()
-            self:runJob(companies, override)
+            -- Native Trapper uses the same yieldable LuaJIT xpcall boundary.
+            -- Cleanup must also run after unexpected exceptions, not only success.
+            local ok, err = xpcall(function()
+                if not keep_awake() then error("下载活动保护未能启动") end
+                self:runJob(companies, override)
+            end, debug.traceback)
+            release_pause()
+            self.sec_download_active = nil
+            self.sec_download_cancelled = nil
             self.sec_busy = false
+            if not ok then
+                Trapper:reset()
+                logger.warn("secfilings: download failed", err)
+                self:showMessage(_("下载已中断，已完成的原文保留。可重新下载继续；详情见日志。"))
+            end
         end)
     end)
+end
+
+-- Manual sleep is not prevented. Stop at the next safe checkpoint after wakeup;
+-- a suspended Kindle cannot promise network progress in the background.
+function SecFilings:onSuspend()
+    if self.sec_download_active then self.sec_download_cancelled = true end
 end
 
 --- An explicit search selection downloads exactly that filing without changing subscriptions.
@@ -957,9 +1019,10 @@ function SecFilings:jobOpts(companies, override)
         table_avail_em  = self:tableAvailEm(),
 
         -- 关注列表：sec_job 用 planUpdates 做增量过滤并就地推进基线。
-        -- **不传 save_watchlist**：它传 true 会退成 nil、不落盘。落账由本文件
-        -- 在 runJob 里自己做，保持只有一个写入者。
+        -- Main owns settings persistence. Checkpoint each committed original,
+        -- and save final baseline again when the batch ends.
         watchlist       = self.watchlist,
+        on_filing_committed = function() return self:saveWatchlist() end,
 
         -- 封面素材目录（<cik>.jpg + generic.jpg）
         cover_dir       = self:getCoverDir(),
@@ -972,7 +1035,7 @@ function SecFilings:jobOpts(companies, override)
     return opts
 end
 
---- 真正跑一轮。注意：绝不能给它套 pcall（见文件头第 2 点）。
+--- 真正跑一轮。进度允许 yield，清理由 startDownload 的外壳统一负责。
 function SecFilings:runJob(companies, override)
     local list = companies or self:watchedCompanies()
 
@@ -983,16 +1046,21 @@ function SecFilings:runJob(companies, override)
 
     -- Trapper:info 返回 false 表示用户把进度框点掉了。它就是那个 yield 点，
     -- 只能一路用返回值传出去。
-    local progress_cb = function(msg) return Trapper:info(msg) end
+    local progress_cb = function(msg)
+        if self.sec_download_cancelled then return false end
+        local continued = Trapper:info(msg)
+        return continued and not self.sec_download_cancelled
+    end
 
     local results, errors, info = SecJob.run(list, self:jobOpts(list, override), progress_cb)
 
     Trapper:reset()
-    self:reportResult(results, errors, info)
-
-    -- 这轮跑过之后关注列表里的基线被推进了，写回磁盘。
-    -- sec_job 不负责落盘（不传 save_watchlist），写入者只有这一处。
+    -- Persist before presenting a dialog (or handling a pending suspend).
     self:saveWatchlist()
+    if self.sec_download_cancelled then
+        errors[#errors+1] = "设备休眠，下载已暂停；已完成原文保留，请再次下载继续。"
+    end
+    self:reportResult(results, errors, info)
 end
 
 --- 把错误说明翻成用户能看懂的话。kind 由各模块统一给出。
