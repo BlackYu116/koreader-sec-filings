@@ -199,7 +199,7 @@ http.request=function(req) wire=req;req.sink('response-body');return 1,200 end
 response={choices={{finish_reason='stop',message={content='营收'}}}}
 check(T:new({api_key='offline-test-key',thinking=true}):translateText('Revenue')=='营收' and payload.thinking.type=='enabled' and payload.reasoning_effort=='high','thinking preferences preserved on wire without live API')
 local marks=T:new{transport=function() error('trademark must not dispatch') end}
-for _,mark in ipairs({'iPhone','Mac','iPad','iPhone®','Mac®','iPad®','Brand™','Mac&reg;','Mac&#174;','Mac&#xAE;','Brand&trade;','Brand&#8482;','Brand&#x2122;'}) do
+for _,mark in ipairs({'iPhone','Mac','iPad','iPhone®','Mac®','iPad®','Brand™','Mac&reg;','Mac&#174;','Mac&#xAE;','Brand&trade;','Brand&#8482;','Brand&#x2122;','Epic Games','Kevan Parekh','/s/ Kevan Parekh'}) do
     check(marks:translateText(mark)==mark and marks.request_count==0,'standalone marked trademark stays literal: '..mark)
 end
 local _,inline_tokens=T._batch.protect('iPhone® Revenue $100')

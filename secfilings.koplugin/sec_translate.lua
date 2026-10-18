@@ -161,8 +161,12 @@ local function protect(text)
         :gsub('&#[xX][aA][eE];$', '®'):gsub('&trade;$', '™'):gsub('&#8482;$', '™')
         :gsub('&#[xX]2122;$', '™')
     -- Exact product labels observed in SEC tables also remain untranslated.
+    -- Brands and signature names observed in filings (e.g. Epic Games,
+    -- /s/ Kevan Parekh) are literal identifiers: a correct translation keeps
+    -- them as-is, which the Chinese-body check would otherwise reject.
     -- Never generalize this to arbitrary English titles or surrounding prose.
     if text == 'iPhone' or text == 'Mac' or text == 'iPad'
+        or text == 'Epic Games' or text == '/s/ Kevan Parekh' or text == 'Kevan Parekh'
         or trademark:match('^[%a][%w_.%-]*®$') or trademark:match('^[%a][%w_.%-]*™$') then
         tokens.requires_language = false
     end
