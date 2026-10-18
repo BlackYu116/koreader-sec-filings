@@ -79,3 +79,34 @@
 唤醒后先核实当前界面和版本，重新预检剩余请求不得超过85，显式续译；不要重装旧包或从头翻译。需要完成成书、真实阅读、整本结构/数字验证和财务语义抽查，再核验动态勾选、搜索刷新/取消及长详情。大任务隔离/内存峰值、旧attempt管理、8-K附件补齐与长深睡仍是独立未完成事项。
 
 精确交接与截图：会话工作台`deploy-028/CONTINUE.md`；该文件最上方是最新状态，下方保留历史。
+
+## 2026-10-17 深夜：r5 部署 + 架构转向 Mac 端翻译 + Apple 整本完成
+
+用户拍板：今后重负载翻译在 Mac agent 完成、成品直接发送设备，不再消耗 Kindle 算力。本轮全程遵守既有付费边界。
+
+### r5 部署（20:57–23:10 PDT）
+
+- r5 = r4 + 传输层优化：`deliverables/secfilings-0.2.8-candidate-r5.zip`（31 文件，488,230 字节，SHA256 `f7b51c62cf31bf9c13164aef710989066510be248a47806787bd3511e9e4aa62`；仅 `_meta.lua`、`sec_translate.lua` 相对 r4 变化）。
+- 主机全套 52943 检查 + 44 语法 + host EPUB 通过（`--native-lfs`）。运维注：主机跑批必须 `--native-lfs`，否则 batch 组因 shell 文件适配超时；Mac 睡眠会中断套件。
+- 设备：备份 `/mnt/us/secfilings-backup-20261017-028-r5-58cde50a/`，31 文件哈希逐一吻合，正常 GUI 菜单重启（顶部菜单→hamburger→退出→重启 KOReader，PID 29955→18433），SEC+work 667 文件无损，387 缓存片段保留。
+- 部署后设备处于 FileManager；用户 Meta 阅读进度在侧车中未动。
+
+### Mac 端翻译管线（新工作模式）
+
+- 运行器在会话工作台 `mac-translate/`（http-curl.lua 用 curl 实现 socket.http 同接口；run_translate.lua 复用仓库 sec_library.translate 生产路径，fingerprint/缓存身份与设备一致；inspect-pending.lua 离线重构待译批，零网络）。
+- 设备 Key 经 SSH 管道复制到 `~/.config/secfilings/deepseek.key`（0600，全程不显示）。deepseek-flash + thinking high。
+- 预检（零成本）：44 请求/154 块/42,471 字节，缓存命中 923。
+
+### 整本完成过程
+
+- Run1（16 请求，15 成功）第 16 批被"译文缺少中文正文"拒：批内独立品牌 `Epic Games` 被模型正确保留却触发零 CJK 整批拒绝。离线诊断确认剩余 101 块中另有签名人名 `/s/ Kevan Parekh`、`Kevan Parekh` 同类风险。
+- 修复（commit `1f36f0d`）：按 r4 iPhone/Mac/iPad 先例将三个精确独立名字标记为字面量；52946 检查通过。**该修复在源码，设备 r5 尚未包含；下次自然设备触达时再部署 r6，不影响阅读。**
+- Run2（~20 请求）翻译全部完成，包装阶段因 host purgeDir 存根对不存在目录报错崩（运行器 bug，非生产代码）；Run3 零请求纯缓存装配成功。
+- 今晚合计 ~36 次真实请求；历史累计 ~106 ≤ 120 总额。
+
+### 成品与验收边界
+
+- 中文书：`documents/SEC 财报/苹果 [CIK 0000320193]/2026-07-31 · 10-Q · 0000320193-26-000020 · 中文.epub`（237,761 字节包内内容，SHA256 前20 `55c7e222d4377409eef0`，设备哈希一致）。
+- 设备工作目录：translation.json `status=complete`，缓存 538 片段（387+151 新增）。
+- 结构检查：mimetype 首条 STORED、XML 全部可解析、SECX 占位符零残留、全书 20,357 中文字符、金额数字原样保留（364,357/254,940/416,161 等）。
+- **未完成**：设备端实机打开阅读验收（留给用户）、财务语义逐项抽查、长深睡验证。语义质量以抽查样例为证，不称全本逐句验收。
