@@ -110,3 +110,11 @@
 - 设备工作目录：translation.json `status=complete`，缓存 538 片段（387+151 新增）。
 - 结构检查：mimetype 首条 STORED、XML 全部可解析、SECX 占位符零残留、全书 20,357 中文字符、金额数字原样保留（364,357/254,940/416,161 等）。
 - **未完成**：设备端实机打开阅读验收（留给用户）、财务语义逐项抽查、长深睡验证。语义质量以抽查样例为证，不称全本逐句验收。
+
+### r6 部署与 GitHub 同步（23:40 PDT 收尾）
+
+- r6 = r5 + Epic Games/Kevan Parekh 字面量豁免：`deliverables/secfilings-0.2.8-candidate-r6.zip`（31 文件，488,346 字节，SHA256 前16 `bce81d3859572158`；仅 `sec_translate.lua` 相对 r5 变化）。
+- 设备：备份 `/mnt/us/secfilings-backup-20261017-028-r6-58cde50a/`，31 文件哈希吻合；用户手动正常菜单重启（PID 18433→19619），crash.log 无新错误。设备与源码恢复一致。
+- 中文书在设备上实机打开阅读确认（现金流量表段落抽查），.sdr 进度元数据在位。用户重启后停在 SSH 设置页，属正常界面状态。
+- GitHub：main 快进 `7c028b2 → 3aa254f`（0.2.5–0.2.8 全部公开），`fix/download-reliability` 分支同步。无 tag/Release。
+- 遗留：中文书完整逐节阅读验收由用户日常使用完成；财务语义抽查、长深睡验证仍未做。Mac 端翻译管线可复用，后续翻译默认走该路径。
