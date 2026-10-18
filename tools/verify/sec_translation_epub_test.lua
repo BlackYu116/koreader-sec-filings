@@ -7,6 +7,8 @@ local Filing=require("sec_filing")
 local Library=require("sec_library")
 local Epub=require("sec_epub")
 local opts={work_dir=root .. "/work",out_dir=root .. "/books",deepseek_api_key="offline-fixture"}
+opts.translation_batch_mode=arg[2]=="batch"
+local expected_requests=opts.translation_batch_mode and 1 or 3
 local lib=Library:new(opts)
 local co={cik=320193,name="Fixture Company"}
 local filing={accn="0000320193-26-000001",form="10-Q",date="2026-10-01"}
@@ -36,9 +38,9 @@ translator.transport=function(text)
         :gsub("was","为"):gsub("were","为"):gsub("in","在")
 end
 local stats=assert(lib:estimate(co.cik,filing.accn,translator))
-assert(stats.requests==3,"repeated paragraph estimated only once")
+assert(stats.requests==expected_requests,"repeated paragraphs and batch planning agree")
 local path=assert(lib:translate(co.cik,filing.accn,translator))
-assert(calls==3,"cached repeated paragraphs dispatch only once")
+assert(calls==expected_requests,"cached repeated fragments follow planned calls")
 assert(Files.readFile(original)~=Files.readFile(path),"independent language files")
 -- Reconstruct with the REAL archiver, not the unit-test writer. Preserve both sidecars.
 local source_before=assert(Files.readFile(record.paths.source))
@@ -63,4 +65,4 @@ end
 print("PASS real EPUB original reconstruction; source/state/Chinese/reading records preserved")
 print("ORIGINAL=" .. original)
 print("CHINESE=" .. path)
-print("PASS real EPUB pair generated; fixture API calls=3; host/device environment must be reported separately")
+print("PASS real EPUB pair generated; fixture API calls="..calls.."; host/device environment must be reported separately")

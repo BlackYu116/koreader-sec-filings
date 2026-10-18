@@ -134,7 +134,7 @@ local failed_cp=options("failed-checkpoint"); failed_cp.translate=false; failed_
 assert(Files.add(failed_cp.watchlist,{cik=1318605,name="特斯拉",forms={"8-K"}}))
 failed_cp.on_filing_committed=function() return false,"disk failure" end
 local fcr,fce,fci=Job.run(companies,failed_cp)
-check(#fcr==1 and #fce>0 and fci.cancelled,"checkpoint failure stops remaining work without losing committed original")
+check(#fcr==1 and #fce>0 and fci.persistence_failed and not fci.cancelled,"checkpoint failure stops remaining work without losing committed original or impersonating cancellation")
 local clean_before=source.cleanHtml
 source.cleanHtml=function() error("cancelled clean ran") end
 local cancel_clean=options("cancel-before-clean"); cancel_clean.translate=false

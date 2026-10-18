@@ -95,6 +95,8 @@ local SecEpub = require("sec_epub")
 local SecImages = require("sec_images")
 local SecMetrics = require("sec_metrics")
 local SecWatchlist = require("sec_watchlist")
+local DownloadQueue = require("sec_download_queue")
+local DownloadTrace = require("sec_download_trace")
 local Filing = require("sec_filing")
 local Library = require("sec_library")
 
@@ -280,8 +282,9 @@ local function fetchMetadata(src, companies, opts, progress_cb, notes)
         if not filings then
             notes[#notes + 1] = string.format("%s：取文件清单失败（%s）", company.name, tostring(err))
             filings = {}
+            err = err or "元数据请求未返回结果"
         end
-        fetched[#fetched + 1] = { cik = company.cik, name = company.name, filings = filings }
+        fetched[#fetched + 1] = { cik = company.cik, name = company.name, filings = filings, error = err }
     end
     return fetched, notes, false
 end
@@ -339,6 +342,12 @@ local function planRun(src, companies, opts, progress_cb, warnings)
     end
 
     local updates
+    local metadata_errors = {}
+    for _, fetched_company in ipairs(fetched or {}) do
+        if fetched_company.error then
+            metadata_errors[SecWatchlist.normalizeCik(fetched_company.cik)] = fetched_company.error
+        end
+    end
     if fetched then
         local uerr
         updates, uerr = SecWatchlist.planUpdates(planView(wl, opts), fetched, {
@@ -358,7 +367,9 @@ local function planRun(src, companies, opts, progress_cb, warnings)
     for ci = 1, #companies do
         local company = companies[ci]
         local update = index[SecWatchlist.normalizeCik(company.cik) or ""]
-        if update then
+        if metadata_errors[SecWatchlist.normalizeCik(company.cik)] then
+            worklist[#worklist+1] = {company=company, error="取文件清单失败：" .. tostring(metadata_errors[SecWatchlist.normalizeCik(company.cik)])}
+        elseif update then
             -- planUpdates 自己报出的注意事项（元数据没取到、日期读不出来、重复 accession…）
             -- 必须带出去。它们正是「为什么这次什么都没下」的答案。
             local uw = update.warnings or {}
@@ -537,7 +548,9 @@ local function gatherFiling(src, company, filing, fi, run_opts, progress_cb, ctx
     end
 
     local fetch_started = os.time()
+    DownloadTrace.mark("fetch","start",company,filing.accn)
     local content, cerr = src:filingContent(company.cik, filing)
+    DownloadTrace.mark("fetch","end",company,filing.accn,content and #(content.html or ""))
     if not content then
         ctx.skipped[#ctx.skipped + 1] = string.format("%s %s（%s）",
             filing.form, filing.date, tostring(cerr))
@@ -556,7 +569,9 @@ local function gatherFiling(src, company, filing, fi, run_opts, progress_cb, ctx
         content.html = nil
         return raw
     end
+    DownloadTrace.mark("clean","start",company,filing.accn,#(content.html or ""))
     local cleaned, cinfo = src:cleanHtml(takeHtml())
+    DownloadTrace.mark("clean","end",company,filing.accn,cleaned and #cleaned)
     logger.info(string.format("secfilings: stage=clean accession=%s seconds=%d lua_kib=%d",
         filing.accn, os.time() - clean_started, collectgarbage("count")))
     if not cleaned or #cleaned < 200 then
@@ -595,8 +610,10 @@ local function gatherFiling(src, company, filing, fi, run_opts, progress_cb, ctx
                     "原文含 %d 张图片，但清理阶段没有保留图片标签，本轮图片未取到；"
                     .. "此处为原文的文字层，数字与表格均在", raw_images)
             else
+                DownloadTrace.mark("images","start",company,filing.accn)
                 local new_html, res, ierr, cancelled = fetchImages(company, filing, fi,
                     cleaned, content.url, run_opts, ctx, progress_cb)
+                DownloadTrace.mark("images","end",company,filing.accn,ctx.image_bytes)
                 if cancelled then return nil, true end
                 if not res then
                     ctx.warnings[#ctx.warnings + 1] = string.format(
@@ -733,6 +750,63 @@ end
 -- 八、跑一轮
 --------------------------------------------------------------------------
 
+-- Freeze only requested enabled companies. A pending batch must be usable
+-- even when recent metadata is unavailable or no longer contains its filings.
+local function planQueuedRun(src, companies, opts, progress_cb, warnings)
+    if opts.selected_filing or not opts.watchlist then
+        return planRun(src, companies, opts, progress_cb, warnings)
+    end
+    local wl = opts.watchlist
+    if wl.load_error then return nil, "关注列表读取失败，不能开始下载：" .. tostring(wl.load_error) end
+    local out = {items={}, no_new={}}
+    for _,company in ipairs(companies) do
+        local entry = not company.ad_hoc and SecWatchlist.find(wl, company.cik)
+        if entry and entry.enabled == false and opts.only_enabled ~= false then
+            warnings[#warnings+1] = company.name .. "：已关闭关注，保留未完成批次"
+        elseif entry and entry.pending_batch ~= nil then
+            local item, err = DownloadQueue.resume(entry, opts)
+            if item then
+                item.company = company
+                if #item.filings == 0 then
+                    local frozen = entry.pending_batch.update.new_filings
+                    local ok, cerr = DownloadQueue.complete(wl, entry.cik, frozen[#frozen].accn)
+                    if not ok then return nil,cerr end
+                    out.no_new[#out.no_new+1] = company.name
+                else
+                    out.items[#out.items+1] = item
+                    warnings[#warnings+1] = company.name .. "：继续固定批次；新的份数设置下批生效"
+                end
+            else
+                out.items[#out.items+1] = {company=company,error=err}
+            end
+        elseif entry and not entry.seen_upto_date
+                and (#(entry.seen or {}) > 0 or entry.first_run_done) then
+            out.items[#out.items+1] = {company=company,
+                error="旧下载进度缺少初始批次和基线；请确认重置下载记录，不自动补入更老申报"}
+        else
+            local one_opts = {}
+            for k,v in pairs(opts) do one_opts[k]=v end
+            if entry then
+                one_opts.watchlist = {entries={entry},version=wl.version,keep_seen=wl.keep_seen}
+            else
+                one_opts.watchlist = nil
+            end
+            local plan, err = planRun(src,{company},one_opts,progress_cb,warnings)
+            if not plan then return nil,err end
+            for _,name in ipairs(plan.no_new or {}) do out.no_new[#out.no_new+1]=name end
+            for _,item in ipairs(plan.items) do
+                if item.update and not item.error then
+                    local ok, qerr = DownloadQueue.begin(entry,item.update,opts)
+                    if not ok then item.error=qerr;item.filings=nil
+                    else item.queued=true end
+                end
+                out.items[#out.items+1]=item
+            end
+        end
+    end
+    return out
+end
+
 local function runSingleFilings(companies, opts, progress_cb)
     -- Cancellation is sticky, even when an optional stage returns a soft error.
     local callback, stopped = progress_cb, false
@@ -755,6 +829,13 @@ local function runSingleFilings(companies, opts, progress_cb)
     run_opts.first_run_new = tonumber(opts.first_run_new)
     run_opts.only_enabled = opts.only_enabled
     run_opts.watchlist = opts.watchlist
+    -- Explicit recent-N is not an incremental subscription operation, even if
+    -- the same CIK is disabled, has a baseline, or has a pending fixed batch.
+    local all_temporary = #companies > 0
+    for _, company in ipairs(companies) do
+        if not company.ad_hoc then all_temporary = false; break end
+    end
+    if all_temporary then run_opts.watchlist = nil end
     run_opts.save_watchlist = opts.save_watchlist
     run_opts.cover_dir = opts.cover_dir
     run_opts.table_avail_em = opts.table_avail_em
@@ -801,12 +882,37 @@ local function runSingleFilings(companies, opts, progress_cb)
         math.floor(tonumber(opts.translation_max_files) or 1)))
     local src = configureSource(run_opts, ua, warnings)
     run_opts.source = src
-    local plan, plan_err = planRun(src, companies, run_opts, progress_cb, warnings)
+    local confirmed = run_opts.watchlist and DownloadQueue.snapshot(run_opts.watchlist)
+    local function checkpoint(phase, result)
+        if not run_opts.watchlist or run_opts.selected_filing then return true end
+        local saved, err = true
+        if run_opts.on_watchlist_checkpoint then
+            saved, err = run_opts.on_watchlist_checkpoint(phase, result)
+        elseif phase == "filing" and run_opts.on_filing_committed then
+            saved, err = run_opts.on_filing_committed(result)
+        elseif run_opts.save_watchlist then
+            local target = run_opts.save_watchlist
+            if target == true then target=nil end
+            saved, err = SecWatchlist.save(run_opts.watchlist,target)
+        end
+        if not saved then
+            DownloadQueue.restore(run_opts.watchlist,confirmed)
+            info.persistence_failed = true
+            errors[#errors+1] = "下载状态落盘失败，已停止后续下载；已发布原文保留：" .. tostring(err or "保存失败")
+            return false
+        end
+        confirmed = DownloadQueue.snapshot(run_opts.watchlist)
+        return true
+    end
+    info.queue_persistent = (run_opts.on_watchlist_checkpoint ~= nil or run_opts.save_watchlist) and true or false
+    local plan, plan_err = planQueuedRun(src, companies, run_opts, progress_cb, warnings)
     if not plan then
+        if confirmed then DownloadQueue.restore(run_opts.watchlist,confirmed) end
         if plan_err == "cancelled" then info.cancelled = true end
         errors[#errors + 1] = tostring(plan_err)
         return results, errors, info
     end
+    if not checkpoint("plan") then return results,errors,info end
     local total = 0
     for pi = 1, #plan.items do total = total + #(plan.items[pi].filings or {}) end
     info.planned = total
@@ -827,14 +933,14 @@ local function runSingleFilings(companies, opts, progress_cb)
         -- Seen means the original AND its resumable snapshot were committed.
         if item.update and record then
             item.ok_accns[#item.ok_accns+1] = record.source.filing.accn
-            SecWatchlist.markSeen(run_opts.watchlist, item.company.cik, {record.source.filing.accn}, {})
-            if run_opts.on_filing_committed then
-                local saved, save_err = run_opts.on_filing_committed(result)
-                if saved == false or saved == nil then
-                    errors[#errors+1] = "原文已保存，但进度落盘失败；已停止后续下载：" .. tostring(save_err or "保存失败")
-                    return result, true
-                end
+            local ok, err = DownloadQueue.complete(run_opts.watchlist,item.company.cik,record.source.filing.accn)
+            if not ok then
+                DownloadQueue.restore(run_opts.watchlist,confirmed)
+                info.persistence_failed=true
+                errors[#errors+1]="批次状态提交失败：" .. tostring(err)
+                return result,true
             end
+            if not checkpoint("filing",result) then return result,true end
         end
         if translator and record then
             if translation_files >= max_translation_files then
@@ -890,7 +996,9 @@ local function runSingleFilings(companies, opts, progress_cb)
         if cached then
             metrics_ch, metrics_data = cached.chapter, cached.data
         else
+            DownloadTrace.mark("metrics","start",company,filing.accn)
             metrics_ch, metrics_data = metricsChapter(company, run_opts, progress_cb)
+            DownloadTrace.mark("metrics","end",company,filing.accn)
             if metrics_ch then
                 metrics_data = {ok_count=metrics_data and metrics_data.ok_count or 0}
                 metrics_cache[metric_key] = {chapter=metrics_ch, data=metrics_data}
@@ -905,8 +1013,8 @@ local function runSingleFilings(companies, opts, progress_cb)
         end
         if not chapter then
             run_opts.current_filing_work_dir = nil
-            errors[#errors + 1] = string.format("%s %s %s：正文不可用", company.name,
-                filing.form, filing.date)
+            errors[#errors + 1] = string.format("%s %s %s（%s）：正文不可用\n%s", company.name,
+                filing.form, filing.date, filing.accn, table.concat(ctx.skipped, "\n"))
             return nil, false
         end
         chapters[#chapters + 1] = chapter
@@ -930,7 +1038,9 @@ local function runSingleFilings(companies, opts, progress_cb)
             return nil, true
         end
         local publish_started = os.time()
+        DownloadTrace.mark("publish","start",company,filing.accn)
         local record, w_err, w_warn = library:publishOriginal(company, filing, book)
+        DownloadTrace.mark("publish","end",company,filing.accn)
         logger.info(string.format("secfilings: stage=publish accession=%s seconds=%d success=%s",
             filing.accn, os.time() - publish_started, tostring(record ~= nil)))
         if type(w_warn) == "table" then
@@ -962,28 +1072,24 @@ local function runSingleFilings(companies, opts, progress_cb)
         end
         for fi = 1, #(item.filings or {}) do
             position = position + 1
+            DownloadTrace.mark("filing","start",item.company,item.filings[fi].accn)
             local result, cancelled = buildOne(item, item.filings[fi], position)
             -- Large HTML/JSON temporaries must not accumulate across a batch.
             collectgarbage("collect")
+            DownloadTrace.mark("filing","after_gc",item.company,item.filings[fi].accn)
             if cancelled then
-                recordSeen(run_opts.watchlist, item.update, item.ok_accns, #item.ok_accns > 0, warnings)
-                info.cancelled = true
-                errors[#errors + 1] = "已取消，剩下的 filing 没有处理"
-                if run_opts.save_watchlist and run_opts.watchlist then
-                    local target = run_opts.save_watchlist
-                    if target == true then target = nil end
-                    SecWatchlist.save(run_opts.watchlist, target)
+                if not info.persistence_failed then
+                    info.cancelled = true
+                    errors[#errors + 1] = opts.selected_filing
+                        and "已取消；请在查询结果中重新选择这份申报重试，已完成原文会复用"
+                        or (item.queued and "已取消，固定批次中的剩余申报下次继续"
+                            or "已取消；已完成原文保留。再次下载会重新选择最近文件，并复用已有原文")
                 end
                 return results, errors, info
             end
         end
-        recordSeen(run_opts.watchlist, item.update, item.ok_accns, #item.ok_accns > 0, warnings)
     end
-    if run_opts.save_watchlist and run_opts.watchlist then
-        local target = run_opts.save_watchlist
-        if target == true then target = nil end
-        SecWatchlist.save(run_opts.watchlist, target)
-    end
+    checkpoint("finish")
     return results, errors, info
 end
 

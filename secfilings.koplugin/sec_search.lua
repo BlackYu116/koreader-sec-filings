@@ -1092,6 +1092,9 @@ local function absorbColumns(cols, st, flt)
         else
             st.scanned = st.scanned + 1
             st.form_counts[form] = (st.form_counts[form] or 0) + 1
+            if passesDateFilter(flt, date) and passesFormFilter({amendments=flt.amendments}, form) then
+                st.window_counts[form] = (st.window_counts[form] or 0) + 1
+            end
 
             if st.matched >= flt.max_total then
                 st.budget_full = true
@@ -1220,6 +1223,7 @@ function SecSearch:listFilings(cik, opts)
         entries = out.entries,
         seen = {},
         form_counts = {},
+        window_counts = {},
         scanned = 0,
         matched = 0,
         duplicates = 0,
@@ -1325,6 +1329,15 @@ function SecSearch:listFilings(cik, opts)
         return a.form < b.form
     end)
     out.form_summary_all = all
+    -- UI filters need the date/amendment window, independent of active form selection.
+    out.form_summary_window = {}
+    for form, n in pairs(st.window_counts) do
+        out.form_summary_window[#out.form_summary_window + 1] = {form=form, count=n}
+    end
+    table.sort(out.form_summary_window, function(a,b)
+        if a.count ~= b.count then return a.count > b.count end
+        return a.form < b.form
+    end)
     -- 分布是否完整：截断过或丢过分片，就说明用户要的东西可能缺；
     -- 因 since 提前收工不算缺（那些本来就在时间窗之外），但分布只覆盖时间窗，要说明。
     out.form_summary_partial = out.truncated or src.sources_failed > 0

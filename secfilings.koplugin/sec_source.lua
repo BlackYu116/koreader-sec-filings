@@ -36,7 +36,6 @@ SEC 财报到可读 EPUB 的抓取与挑选逻辑。
 ]]
 
 local http = require("socket.http")
-local ltn12 = require("ltn12")
 local json = require("json")
 local logger = require("logger")
 
@@ -64,12 +63,10 @@ local SecSource = {}
 SecSource.PLACEHOLDER_USER_AGENT = "koreader-sec-filings (联系邮箱未设置)"
 SecSource.user_agent = SecSource.PLACEHOLDER_USER_AGENT
 
--- 超过这个大小的文档跳过。这个值是按实测定的：
---   微软 10-K（8.6MB）在设备上取回 4s、清理 57s、打包 1s，峰值内存 115MB，能跑通；
---   所以 12MB 能把真实的 10-K 收进来，同时拦住真正离谱的文件。
--- 代价要知道：碰到超大文档，那一家会卡住一分钟左右（进度框停在「正在取 …」不动），
--- 并且会短暂吃掉一百多 MB 内存。
+-- Bound retained response bytes while receiving, not after concatenation.
+-- These are not whole-process memory budgets: concat/cleaner/ReaderUI add memory.
 SecSource.max_doc_bytes = 12 * 1024 * 1024
+SecSource.max_metadata_bytes = 8 * 1024 * 1024
 
 -- ---- 宽表格列拆分的三个参数（详见 splitWideTables 的注释） ----
 --
@@ -228,8 +225,12 @@ local warned_no_email = false
 ---
 --- UA 的取值顺序：本次显式传入的 > 实例上的 user_agent > 模块默认（占位值）。
 ---@param user_agent string|nil 本次请求专用的 UA（不传就用实例上的）
-function SecSource:fetch(url, attempts, user_agent)
+function SecSource:fetch(url, attempts, user_agent, max_bytes)
     attempts = attempts or 3
+    max_bytes = tonumber(max_bytes or self.max_metadata_bytes)
+    if not max_bytes or max_bytes < 1 or max_bytes ~= max_bytes or max_bytes == math.huge then
+        return nil, "响应大小上限无效"
+    end
     local ua = user_agent or self.user_agent
     if not emailIn(ua) and not warned_no_email then
         warned_no_email = true
@@ -239,22 +240,37 @@ function SecSource:fetch(url, attempts, user_agent)
     local last_err
 
     for try = 1, attempts do
-        local chunks = {}
+        local chunks, bytes, oversized, stream_error = {}, 0, false, false
         local old_timeout = http.TIMEOUT
         http.TIMEOUT = 120
-        local ok, code = http.request{
+        -- Only the synchronous socket call is protected; no Trapper/yield chain here.
+        local ran, ok, code = pcall(http.request, {
             url = url,
             headers = { ["user-agent"] = ua },
-            sink = ltn12.sink.table(chunks),
-        }
+            sink = function(chunk, err)
+                if err then stream_error = true; return nil, err end
+                if oversized then return nil, "response size limit" end
+                if chunk then
+                    if bytes + #chunk > max_bytes then
+                        oversized = true
+                        chunks = {} -- release retained chunks immediately on rejection
+                        return nil, "response size limit"
+                    end
+                    bytes = bytes + #chunk
+                    chunks[#chunks+1] = chunk
+                end
+                return 1
+            end,
+        })
         http.TIMEOUT = old_timeout
-
-        local body = table.concat(chunks)
-        if ok and (tonumber(code) or 0) < 400 and #body > 0 then
-            return body
+        if oversized then return nil, "响应超过接收大小上限，已停止下载；未自动重试" end
+        if not ran then return nil, "下载请求异常；未自动重试" end
+        local status = tonumber(code)
+        if ok and not stream_error and status and status >= 200 and status < 300 and bytes > 0 then
+            return table.concat(chunks)
         end
-
-        last_err = httpErrorText(code, #body, ua)
+        chunks = nil
+        last_err = httpErrorText(code, bytes, ua)
 
         -- 4xx 是「这个请求本身不对」，重试无意义；5xx 与网络错误才值得重试
         local n = tonumber(code)
@@ -376,7 +392,7 @@ function SecSource:filingContent(cik, filing, user_agent)
     if not chosen or chosen == "" then return nil, "挑不出正文文档" end
 
     local url = dir .. chosen
-    local body, err = self:fetch(url, nil, user_agent)
+    local body, err = self:fetch(url, nil, user_agent, self.max_doc_bytes)
     if not body then return nil, "取文档失败: " .. tostring(err) end
 
     if #body > self.max_doc_bytes then
@@ -1743,11 +1759,8 @@ function SecSource:cleanHtml(raw)
     -- 保证交给硬校验器的就是最终字符串。
     s = fixBareAttributes(s)
 
-    -- 11) 清掉块级元素之间残留的空白。
-    -- 曾担心这会吃掉行内标签之间的空格、把单词粘连，于是在原始文档里实测过：
-    -- 特斯拉 10-Q（1.57MB）里「行内闭合标签 + 空白 + 行内开标签」出现 0 次，
-    -- 「行内闭合标签 + 空白 + 普通文本」也是 0 次，所以这条折叠是安全的。
-    s = s:gsub(">%s+<", "><")
+    -- Keep inter-tag whitespace: adjacent inline elements may separate words,
+    -- amounts or units. A sample without such boundaries cannot justify global removal.
 
     return s, info
 end

@@ -54,7 +54,7 @@ Search.resolve=function(self,q)
     resolves=resolves+1
     if q=='bad' then return nil,'offline failure','network' end
     if q=='late' then plugin:startSearch('fresh') end
-    if q=='ambiguous' then return true,{ambiguous=true,aliases={{cik=1,name='A'},{cik=2,name='B'}}} end
+    if q=='ambiguous' then return true,{ambiguous=true,candidates_total=50,candidates_truncated=true,aliases={{cik=1,name='A'},{cik=2,name='B'}}} end
     return true,{cik=320193,cik_num=320193,name=q,ticker='TEST'}
 end
 Search.listFilings=function(self,cik,opts)
@@ -84,6 +84,12 @@ local before=fetches; local net=network
 plugin:setSearchForms({'10-Q'})
 check(fetches==before and network==net and #plugin.search_state.list.entries==22,'complete set filters locally with amendment semantics')
 check(plugin.search_state.page==1 and plugin.search_state.form_key=='10-Q','new filter resets to its first page')
+check(find(plugin:getFormFilterItems(),'10-Q（22 份）'),'form count includes amendments matched by the filter')
+local summary=plugin.search_state.summary
+plugin.search_state.summary={}
+for i=1,30 do plugin.search_state.summary[i]={form='FORM'..i,count=1} end
+check(find(plugin:getFormFilterItems(),'FORM30（1 份）')~=nil,'all thirty form filters are reachable through native pagination')
+plugin.search_state.summary=summary
 plugin:setSearchForms(nil)
 check(plugin.search_state.page==2 and #plugin.search_state.list.entries==45,'return to all forms preserves previous page')
 window=plugin._search_window
@@ -99,6 +105,7 @@ mode='failure'; plugin:startSearch('other')
 check(plugin.search_state==saved,'failed filings fetch retains previous results')
 mode='normal'; plugin:startSearch('ambiguous')
 check(plugin.search_state.candidates and plugin._search_window,'ambiguous companies open choice panel directly')
+check(plugin.search_state.candidates_total==50 and find(plugin._search_window.item_table,'仅显示前 2 家'),'candidate truncation is visible')
 local chooser=plugin._search_window
 chooser.onMenuSelect(chooser,find(chooser.item_table,"A"))
 check(plugin.search_state.company and not plugin.search_state.candidates and plugin._search_window,'company selection fetches and displays filings')
@@ -127,7 +134,7 @@ window=plugin._search_window; local selected
 plugin.startFilingDownload=function(self,company,filing) selected=filing end
 local row=find(window.item_table,'2026-10-01')
 window.onMenuSelect(window,row)
-check(selected and window.closed and plugin.search_state.query=='new-queued','exact filing download closes results while preserving state')
+check(selected and not window.closed and plugin._search_window==window and plugin.search_state.query=='new-queued','exact filing keeps a return path beneath download prompts and summary')
 plugin:showSearchResults(); before=fetches
 window.onMenuSelect(window,row)
 check(fetches==before,'closed stale result window is inert')
@@ -136,4 +143,65 @@ check(resolves==before,'active SEC job blocks new search')
 local date=os.date; os.date=function() return {year=2028,month=2,day=29} end
 check(plugin:sinceDate(3)=='2025-02-28','leap-day search window produces a valid date')
 os.date=date
+-- Subscription persistence errors must not leave optimistic live state.
+plugin.sec_busy=false
+local original_save=Files.save
+local snapshot=Files.serialize(plugin.watchlist)
+local count_shown=#shown
+Files.save=function() return nil,'disk full' end
+plugin:watchCompany({cik=987654,name='New'})
+check(Files.serialize(plugin.watchlist)==snapshot,'failed add rolls live watchlist back')
+check(not shown[#shown].text:find('已把',1,true),'failed add never reports success')
+plugin:toggleWatch(320193)
+check(Files.serialize(plugin.watchlist)==snapshot,'failed toggle rolls live watchlist back')
+plugin:setAllWatched(false)
+check(Files.serialize(plugin.watchlist)==snapshot,'failed set-all rolls live watchlist back')
+Files.save=function() error('test exception') end
+local changed=pcall(function() plugin:watchCompany({cik=987654,name='New'}) end)
+check(changed and Files.serialize(plugin.watchlist)==snapshot,'thrown save restores state without escaping UI')
+Files.save=function() return nil,'disk full' end
+check(plugin:watchForm({cik=320193,name='Apple'},'NEW-FORM')==nil and Files.serialize(plugin.watchlist)==snapshot,'failed per-form subscription edit is one atomic rollback')
+Files.save=original_save
+plugin.search_state={company={cik=320193,name='Apple'},list={entries={},form_summary_scope='partial'},page=1}
+check(not find(plugin:getSearchItems(),'没有符合条件'),'partial empty never claims proven absence')
+check(find(plugin:getSearchItems(),'部分结果'),'partial empty explains incomplete retrieval')
+local recent=find(plugin:getSearchItems(),'下载这家最近')
+local old_start=plugin.startDownload
+plugin.startDownload=function(self,companies) check(companies[1].ad_hoc==true,'search recent-N explicitly bypasses subscriptions') end
+recent.callback();plugin.startDownload=old_start
+-- Product-state regressions: open menus must follow committed state, not snapshots.
+local watch=plugin:getWatchlistItems()[1]
+local was=watch.checked_func();watch.callback()
+check(watch.checked_func()~=was,'open watch menu reflects successful toggle')
+Files.save=function() return nil,'disk full' end
+local live=watch.checked_func();watch.callback()
+check(watch.checked_func()==live,'open watch menu reflects failed-save rollback')
+Files.save=original_save
+mode='truncated';plugin:startSearch('partial-refresh');plugin:setSearchForms({'10-Q'})
+before=fetches
+plugin:refreshSearch()
+check(fetches==before+1 and plugin.search_state.form_key=='10-Q','explicit refresh bypasses partial cached filter')
+local previous=plugin.search_state.list
+mode='failure';plugin:refreshSearch()
+check(plugin.search_state.list==previous and plugin._search_window,'failed refresh preserves prior visible result')
+mode='normal';plugin:refreshSearch()
+check(next(plugin.search_state.views)==nil,'successful refresh invalidates older filter views')
+local list_filings=Search.listFilings
+Search.listFilings=function(self,cik,opts)
+    local ok,list=list_filings(self,cik,opts)
+    list.form_summary_window={{form='10-Q',count=99},{form='NEW-FORM',count=1}}
+    return ok,list
+end
+plugin.search_state.summary_partial=true
+plugin:refreshSearch()
+check(find(plugin:getFormFilterItems(),'10-Q（99 份）') and find(plugin:getFormFilterItems(),'NEW-FORM')
+    and not plugin.search_state.summary_partial,'filtered refresh updates all-type counts and completeness')
+Search.listFilings=list_filings
+local queued
+local online=package.loaded['ui/network/manager'].runWhenOnline
+package.loaded['ui/network/manager'].runWhenOnline=function(self,fn) queued=fn end
+plugin:startSearch('sleep-pending');before=resolves
+plugin:onSuspend();queued()
+check(resolves==before,'suspend revokes queued search')
+package.loaded['ui/network/manager'].runWhenOnline=online
 print('real main/search UI: '..n..' checks passed; deterministic SEC and widget adapters')

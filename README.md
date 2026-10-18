@@ -1,8 +1,31 @@
 # KOReader SEC Filings — SEC 研习室
 
-**Version 0.2.4** · [中文使用说明](README.zh-CN.md)
+> **2026-10-12 23:58 PDT更新：r4已安装、正常重启，31文件hash匹配。设备52930项通过，真实第一批产品名修复通过；第二请求HTTP0停止，累计70次，新增缓存合计386片段，整本仍未完成。** 详见仓库`docs/DEPLOYMENT-0.2.8.md`；下方旧“未安装”状态不再有效。
 
-> Version 0.2.4 is installed and loaded on the test Kindle. Short lock/wake and touch recovery passed; 27 installed files match the package and 310 protected files are unchanged. Real-crengine isolated tests reduced median cleaning time from 84.87 to 58.43 seconds and peak RSS from 99.68 to 83.66 MiB with identical output. These are not full-batch ReaderUI measurements or long-hibernation validation. See [deployment and limits](docs/DEPLOYMENT-0.2.4.md). No GitHub Release or tag was created.
+> Latest 2026-10-12 23:20 PDT: real testing stopped after 68 requests; full-book acceptance remains incomplete. Device runs r3. Candidate-r4 adds exact standalone product labels and passes 52,930 host checks but is not installed. See [deployment status](docs/DEPLOYMENT-0.2.8.md). Earlier status below is historical.
+
+**Version 0.2.8 candidate — device acceptance in progress** · [中文使用说明](README.zh-CN.md)
+
+> 2026-10-12 22:19 PDT: installed and normally restarted. Host and device-dependency suites pass 583 ordinary plus 52,336 scan checks. Real cancellation and cached continuation were tested; full Chinese-book acceptance remains incomplete. The latest candidate-r3 fixes output-budget, month-digit and standalone-trademark issues found during 35 real requests. Device access is currently blocked pending wake-up. See [deployment and remaining checks](docs/DEPLOYMENT-0.2.8.md).
+
+## New in the 0.2.8 candidate
+
+- Read verified originals/Chinese editions directly from local records and result dialogs.
+- Persistent scrollable result details, live watch/thinking checkmarks, explicit search refresh and pending-search cancellation.
+- Translate ordinary uppercase headings, reject obvious untranslated echoes, preserve inline whitespace and validate legacy caches before reuse.
+- Bound SEC Source response bytes while receiving; this does not solve cleaner/ReaderUI peak memory or long synchronous cancellation.
+- Existing books and reading state are not silently rebuilt. Real UI, full paid translation and deep-sleep acceptance remain pending.
+
+### Historical 0.2.7 deployment
+
+> 2026-10-12: installed and normally restarted on the test Kindle, with zero-paid UI and real Apple preflight acceptance. A placeholder-expansion compatibility issue found on-device was fixed. The real plan is 540 remaining fragments in 100 requests; it was cancelled without model dispatch. Host and device-dependency regressions pass 516 ordinary plus 52,336 scan checks. Real model quality, a complete Chinese filing, production memory and deep sleep remain unverified. See [deployment and limits](docs/DEPLOYMENT-0.2.7.md). Public main was last verified on 0.2.4; no new publication.
+
+## New in 0.2.7
+
+- Bounded batches of up to eight original fragments, individually validated; preserve HTML and reuse validated v2 caches.
+- A separate **整份剩余译文** action preflights finite request, protected-text and complete-HTTP-body limits, then requires explicit confirmation. No silent budget resets, automatic retries or paid restart recovery.
+- Suspend revokes queued network authorizations too; task exceptions and persistence failures stop safely.
+- Temporary recent-N downloads bypass subscription state; tracked updates keep their persistent fixed queue. Failed subscription saves roll back and partial search results remain explicitly incomplete.
 
 Read SEC EDGAR filings as local EPUBs in KOReader. Download an individual filing, preserve its source snapshot, and optionally produce a separate Chinese edition using your own DeepSeek account. No AI-assistant plugin is required.
 
@@ -14,7 +37,7 @@ Read SEC EDGAR filings as local EPUBs in KOReader. Download an individual filing
 - Skip redundant HTML scans and transfer raw-response ownership to reduce retained memory without dropping text, tables or images.
 - An optional Special Offers screensaver companion is in `contrib/kindle/`; it requires separate backup and installation, not automatic plugin installation.
 
-Completed originals are reusable, but **0.2.4 does not yet persist a fixed retry queue**. Missing books with old download history are not silently redownloaded; a history-without-baseline retry can still backfill older filings. Fixed queues and complete production-batch measurements are follow-up work. The menu's version label still says 0.2.3; package metadata identifies 0.2.4.
+Historical 0.2.4 did not persist a fixed retry queue. This candidate retains the 0.2.5–0.2.6 fixed queue, translation-validator and search repairs. Missing books do not silently reset download history. Production memory risk and long-hibernation acceptance remain separate unfinished device work.
 
 ## Earlier in 0.2.2: recovery and search
 
@@ -57,9 +80,10 @@ No launcher, user patch, root filesystem modification or background service is r
 The interface is Chinese. The Tools menu may span two pages.
 
 - **搜索公司…**: search and view the results directly; filtering also returns to the results panel. Selecting a dated filing downloads only that accession.
-- **下载某一家 / 下载全部关注的公司**: download recent new filings according to your preferences.
+- **下载某一家 / 搜索中的最近N份**: temporary recent-N selection, independent of subscription state.
+- **更新关注公司**: manually check incremental updates or resume a frozen batch; not an automatic background schedule.
 - **打开下载目录**: browse generated books.
-- **已有原文 → 生成 / 续译中文版**: choose an original and review translation limits.
+- **已有原文**: choose an original, then a small-budget translation or **整份剩余译文**; both require preflight confirmation.
 - **设置 → 翻译设置（DeepSeek）**: enter a Key on the device, select the model and limits, or enable cache-only mode.
 
 Books default to `/mnt/us/documents/SEC 财报/`. Snapshots, assets and translation caches live under `/mnt/us/secfilings-work/`.
@@ -78,9 +102,11 @@ Legacy cleanup is limited to recognized default-company sidecars and known local
 
 The default model is `deepseek-flash`, with thinking disabled. The account must support the configured model. Only official DeepSeek HTTPS Chat Completions endpoints are accepted; custom credential destinations and redirects are rejected.
 
-Default per-run limits: **one filing, 20 attempted requests, 48,000 protected input bytes**. Request presets are 5, 10 or 20. Each request allows at most 4,096 output tokens. These are **not monetary limits**, and the input counter excludes system-prompt overhead. Failed requests may incur charges. There are no automatic retries after a failure.
+Small-run defaults remain **one filing, 20 reserved/attempted requests and 48,000 protected text bytes**, with 5/10/20 presets. Whole-remaining-task limits equal the shown preflight plan, with hard ceilings of 1,000 requests, 2,000,000 protected bytes and 16,384,000 complete HTTP-body bytes. Each body is capped at 16,384 bytes and each request uses `max_tokens=4096`. These are **not monetary limits**: bytes are not tokens, and input, reasoning and failed attempts may incur charges. Existing model/thinking settings are preserved.
 
-Large filings can require several separately confirmed runs. Text nodes are currently translated individually, not batched. Cached blocks are validated and reused. A completed Chinese edition is not silently replaced when the model changes.
+Batches contain at most eight original fragments (1,200 protected-byte packing target). Original blocks keep their legacy boundaries (default 2,400 raw bytes). Placeholder expansion can exceed that raw limit: these long blocks stand alone, still bounded by the 16,384-byte complete HTTP body cap and cumulative task limits. Each item retains its own protected numbers and must match the response ID/order/count. Invalid responses stop without split retries. Validated fragments are cached before cache-only EPUB assembly. Old v2 caches remain readable without clearing or promoting them in batch mode.
+
+An attempt is reserved durably before dispatch; interrupted reservations may overcount an unsent request. Suspend/cancellation invalidates pending network callbacks and confirmations. New runs require fresh confirmation and never automatically reset the previous authorization. Cached or complete editions are not silently replaced. Placeholder/decimal-digit checks cannot establish financial semantic completeness or detect every numeric expression, such as Chinese number words.
 
 Keys remain in KOReader's local settings, not in an encrypted vault. The editor does not preload the stored Key. Protect the device and settings backups. No Key belongs in an issue, source tree or EPUB.
 
@@ -96,7 +122,7 @@ Version 0.2.2 passed 267 device-dependency checks and 14 additional native-widge
 
 A real Apple 10-Q filed on 2026-07-31 was downloaded through the production UI. ZIP/XML, navigation, 70 tables, embedded source imagery and the cover passed independent checks. Tests and the explicit-sandbox shell entry point are in `tools/verify/`.
 
-**No paid DeepSeek request was made for release validation.** Deterministic fixture translations prove plumbing and preservation checks, not model quality. Numeric/placeholder checks cannot establish financial semantic accuracy. Chinese output is a reading aid, not a replacement for SEC originals.
+**No paid DeepSeek request was made for 0.2.7 candidate validation.** Earlier 0.2.6 repair used two separately authorized short probes, not a full-book translation. Deterministic fixture translations prove plumbing and preservation checks, not model quality. Numeric/placeholder checks cannot establish financial semantic accuracy. Chinese output is a reading aid, not a replacement for SEC originals.
 
 Simulated interruption tests do not establish power-loss/fsync durability. Arbitrary SEC HTML, other devices, all font sizes and all third-party patches are not covered by the test sample. Upstream/network failures and unavailable images are reported rather than concealed.
 

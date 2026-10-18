@@ -232,4 +232,17 @@ check(not owner:previewRelink(own.paths.cik,own.paths.accn,'en',casecandidate),'
 local broken,br=setup('broken'); assert(os.remove(br.original_path))
 put(br.paths.dir..'/original-recovery.json','{"schema":1,"source_hash":"wrong"}')
 check(not broken:load(br.paths.cik,br.paths.accn),'damaged recovery receipt fails closed')
+local reviewlib,rr=setup('review-reading')
+local ren=reviewlib.out_dir..'/renamed-en.epub'
+assert(os.rename(rr.original_path,ren))
+assert(reviewlib:relink(assert(reviewlib:previewRelink(rr.paths.cik,rr.paths.accn,'en',ren))))
+check(reviewlib:readingPath(rr.paths.cik,rr.paths.accn,'en')==ren,'reading resolves renamed original with registered hash')
+assert(os.remove(ren))
+assert(reviewlib:restoreOriginal(assert(reviewlib:previewOriginalRecovery(rr.paths.cik,rr.paths.accn))))
+rr=assert(reviewlib:load(rr.paths.cik,rr.paths.accn))
+check(reviewlib:readingPath(rr.paths.cik,rr.paths.accn,'en')==rr.original_path,'reading accepts recovery receipt hash')
+put(rr.chinese_path,'tampered')
+check(not reviewlib:readingPath(rr.paths.cik,rr.paths.accn,'zh'),'reading rejects altered Chinese')
+check(reviewlib:readingPath(rr.paths.cik,rr.paths.accn,'en')==rr.original_path,'altered Chinese does not block verified original')
+
 print('recovery/relink: '..n..' checks passed; isolated files, fake EPUB writer, no network')

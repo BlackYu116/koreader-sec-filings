@@ -190,7 +190,8 @@ function Library:translator(opts)
         model=opts.deepseek_model, thinking=opts.deepseek_thinking, max_chars=opts.deepseek_chunk_chars,
         timeout=opts.deepseek_timeout,
         cache_only=opts.translation_cache_only, max_requests=opts.translation_max_requests,
-        max_input_bytes=opts.translation_max_input_bytes}
+        max_input_bytes=opts.translation_max_input_bytes, max_wire_bytes=opts.translation_max_wire_bytes,
+        batch_mode=opts.translation_batch_mode}
     translator.library_cache_root = self.work_dir
     return translator
 end
@@ -321,6 +322,20 @@ function Library:recoverOriginal(r)
     return self:verify(r)
 end
 
+-- Resolve the current associated path and verify the registered artifact, without
+-- requiring the other language or source assets to exist just to read a book.
+function Library:readingPath(cik, accn, language)
+    if language ~= "en" and language ~= "zh" then return nil, "阅读语言无效" end
+    local r, err = self:load(cik, accn)
+    if not r then return nil, err end
+    local path = language == "en" and r.original_path or r.chinese_path
+    local expected = language == "en" and r.original_hash or r.chinese_hash
+    if not expected or hashFile(path) ~= expected then
+        return nil, "书籍缺失、位置变化或内容校验不符；请先恢复或重新关联，未打开其他文件。"
+    end
+    return path
+end
+
 function Library:verify(record)
     if hashFile(record.original_path) ~= record.original_hash then
         return nil, "原文 EPUB 缺失或已变化；未发送翻译请求"
@@ -385,19 +400,32 @@ function Library:translate(cik, accn, translator, progress_cb)
     ok, err = Files.ensureDir(parent); if not ok then return nil, err end
     ok, err = self:rememberChineseIdentity(r); if not ok then return nil, err end
     state.status, state.fingerprint = "translating", fingerprint
-    state.output_hash = nil
+    state.output_hash, state.last_error = nil, nil
+    state.last_attempt_at = os.time()
+    state.requests, state.input_bytes = translator.request_count, translator.input_bytes
+    state.wire_bytes, state.cache_hits = translator.wire_bytes, translator.cache_hits
     ok, err = self:saveState(r.paths, state); if not ok then return nil, err end
+    translator.on_attempt = function(current)
+        state.requests, state.input_bytes = current.request_count, current.input_bytes
+        state.wire_bytes, state.cache_hits = current.wire_bytes, current.cache_hits
+        state.last_attempt_at = os.time()
+        return self:saveState(r.paths, state)
+    end
     local function finishFailure(message)
         if message == "已取消" or message:find("上限",1,true) or message:find("仅缓存",1,true) then
             state.status = "paused"
         else state.status = "failed" end
         state.requests, state.input_bytes = translator.request_count, translator.input_bytes
+        state.cache_hits, state.wire_bytes = translator.cache_hits, translator.wire_bytes
+        state.last_error = Translate.failureSummary(message)
         local saved, save_err = self:saveState(r.paths, state)
-        return nil, saved and message or save_err
+        return nil, saved and state.last_error or save_err
     end
     for ci = 1, #r.book.chapters do
-        local translated; translated, err = translator:translateHtml(r.book.chapters[ci].html, function()
-            return not progress_cb or progress_cb("正在翻译 " .. r.source.filing.form .. " " .. r.source.filing.date) ~= false
+        local translated; translated, err = translator:translateChapter(r.book.chapters[ci], function()
+            return not progress_cb or progress_cb(string.format("正在翻译 %s %s · 章节 %d/%d\n本任务请求 %d/%d · 缓存命中 %d · 新译 %d 块", r.source.filing.form,
+                r.source.filing.date, ci, #r.book.chapters, translator.request_count,
+                translator.max_requests, translator.cache_hits, translator.completed_blocks or 0)) ~= false
         end)
         if not translated then return finishFailure(err) end
         r.book.chapters[ci].html = translated
@@ -418,6 +446,7 @@ function Library:translate(cik, accn, translator, progress_cb)
             or not os.rename(staging, r.chinese_path) then return nil, "中文版发布失败；已保留缓存和暂存文件" end
     state.status = "complete"
     state.requests, state.input_bytes = translator.request_count, translator.input_bytes
+    state.cache_hits, state.wire_bytes = translator.cache_hits, translator.wire_bytes
     ok, err = self:saveState(r.paths, state); if not ok then return nil, err end
     return r.chinese_path
 end
@@ -465,6 +494,7 @@ function Library:list()
                             local zh_ok = safePath(zh) and lfs.symlinkattributes(zh, "mode") == "file" or false
                             out[#out+1] = {cik=cik, accn=accn, name=company.name,
                                 form=filing.form, date=filing.date, status=summary.status,
+                                last_error=summary.last_error and Translate.failureSummary(summary.last_error),
                                 original_present=en_ok, chinese_present=zh_ok}
                         else damaged = damaged + 1 end
                         if #out + damaged >= 1000 then return out, damaged, true end

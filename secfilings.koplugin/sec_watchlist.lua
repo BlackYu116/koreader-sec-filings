@@ -613,8 +613,16 @@ end
 local ENTRY_FIELDS = {
     "cik", "name", "legal", "ticker", "forms", "enabled",
     "last_accession", "last_filing_date", "last_checked_at", "last_success_at",
-    "first_run_done", "keep_seen", "seen", "seen_upto_date", "content_chars", "note",
+    "first_run_done", "keep_seen", "seen", "seen_upto_date", "content_chars", "note", "pending_batch",
 }
+
+-- Copy persisted value tables, never share a mutable queue with a checkpoint.
+function SecWatchlist.copyValue(value)
+    if type(value) ~= "table" then return value end
+    local out = {}
+    for k,v in pairs(value) do out[k] = SecWatchlist.copyValue(v) end
+    return out
+end
 
 ---@return table
 function SecWatchlist.cloneEntry(entry)
@@ -623,7 +631,9 @@ function SecWatchlist.cloneEntry(entry)
         local key = ENTRY_FIELDS[_fi]
         local value = entry[key]
         if value ~= nil then
-            if key == "forms" or key == "seen" then
+            if key == "pending_batch" then
+                out[key] = SecWatchlist.copyValue(value)
+            elseif key == "forms" or key == "seen" then
                 local copy = {}
                 for _vi = 1, #value do copy[_vi] = value[_vi] end
                 out[key] = copy
@@ -699,6 +709,9 @@ function SecWatchlist.normalizeEntry(entry)
             and entry.seen_upto_date) or nil,
         content_chars    = tonumber(entry.content_chars) or nil,
         note             = entry.note,
+        -- Retain even unknown/corrupt queues; execution must fail closed rather
+        -- than discard the original retry boundary during normalization.
+        pending_batch    = SecWatchlist.copyValue(entry.pending_batch),
     }
 end
 
@@ -914,7 +927,7 @@ function SecWatchlist.save(wl, target, opts)
         version = wl.version,
         updated_at = wl.updated_at,
         keep_seen = wl.keep_seen,
-        entries = wl.entries,
+        entries = SecWatchlist.cloneList(wl.entries),
     }
     if wl.user_modified_at then payload.user_modified_at = wl.user_modified_at end
     if wl.extra then
@@ -938,11 +951,16 @@ function SecWatchlist.save(wl, target, opts)
     end
 
     if settings then
-        settings.data[opts.key or "sec_watchlist"] = payload
+        local key = opts.key or "sec_watchlist"
+        local previous = settings.data[key]
+        settings.data[key] = payload
         if type(settings.flush) == "function" then
-            local flushed, flush_err = settings:flush()
-            if flushed == false or (flushed == nil and flush_err ~= nil) then
-                return nil, tostring(flush_err or "设置写入失败")
+            -- Settings I/O is synchronous and cannot yield. Catch only this
+            -- boundary so queue rollback also handles thrown flush failures.
+            local called, flushed, flush_err = pcall(settings.flush, settings)
+            if not called or flushed == false or (flushed == nil and flush_err ~= nil) then
+                settings.data[key] = previous
+                return nil, tostring((not called and flushed) or flush_err or "设置写入失败")
             end
         end
         -- KOReader LuaSettings:flush returns self even if util.writeToFile
@@ -952,6 +970,7 @@ function SecWatchlist.save(wl, target, opts)
             local stored = loadTableFile(settings.file)
             if not stored or SecWatchlist.serialize(stored[opts.key or "sec_watchlist"])
                     ~= SecWatchlist.serialize(payload) then
+                settings.data[key] = previous
                 return nil, "设置写后校验失败，下载进度尚未确认落盘"
             end
         end
@@ -1443,6 +1462,11 @@ function SecWatchlist.resetBaseline(wl, cik, opts)
         entry.seen_upto_date = nil
         entry.first_run_done = nil
         entry.last_accession = nil
+        entry.pending_batch = nil
+        if opts.clear_stats then
+            entry.last_success_at = nil
+            entry.content_chars = nil
+        end
         -- last_checked_at / last_filing_date 不动：它们只是展示信息
     end
     wl.user_modified_at = nowSeconds()

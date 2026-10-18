@@ -17,7 +17,7 @@ package.loaded["ffi/util"]={template=function(s,...)
 end}
 package.loaded["logger"]={info=function() end,warn=function() end}
 package.loaded["ui/uimanager"]={show=function(self,w) shown[#shown+1]=w end,close=function() end}
-for i,name in ipairs({"infomessage","inputdialog","confirmbox","menu"}) do
+for i,name in ipairs({"infomessage","inputdialog","confirmbox","menu","textviewer"}) do
     package.loaded["ui/widget/" .. name]={new=function(self,o) o.kind=name; o.onShowKeyboard=function() end; return o end}
 end
 package.loaded["ui/network/manager"]={runWhenOnline=function(self,f) network=network+1; f() end}
@@ -83,7 +83,7 @@ local f=assert(io.open(Filing.outputPath(plugin.sec_out_dir,co,filing,"en"),"wb"
 local lib=Lib:new(plugin:translationOptions())
 local r=assert(lib:register(co,filing,{title="Quarter",chapters={{id="one",heading="Results",html="<p>Revenue 10.</p>"}}}))
 settings.deepseek_api_key=""
-plugin:getLocalTranslationItems()[1].sub_item_table_func()[1].callback()
+find(plugin:getLocalTranslationItems()[1].sub_item_table_func(),"小额度").callback()
 check(shown[#shown].kind=="confirmbox" and calls==0 and network==0,"cache-only preflight shows confirmation without key/network")
 local confirmation=shown[#shown]
 confirmation.ok_callback()
@@ -106,6 +106,35 @@ check(saves==before_saves,"translation does not touch watchlist/settings persist
 settings.deepseek_model=nil; settings.deepseek_api_key=""
 plugin:prepareTranslation(co.cik,filing.accn); shown[#shown].ok_callback()
 check(calls==1 and network==1 and shown[#shown].text:find("已完成",1,true),"completed cached book needs no key or network and is not overwritten")
+local opened,switches
+package.loaded['apps/reader/readerui']={showReader=function(self,path) opened=path end}
+local result=shown[#shown]
+result.buttons_table[1][1].callback()
+check(opened==r.chinese_path,'translation result opens verified Chinese book without another lookup')
+local record=assert(lib:load(co.cik,filing.accn))
+record.state.last_error='已达到本轮翻译请求/输入字节上限；已完成块保留在缓存中'
+assert(lib:saveState(record.paths,record.state))
+plugin:showTranslationStatus({cik=co.cik,accn=filing.accn})
+check(shown[#shown].kind=='textviewer' and #shown[#shown].text>260
+    and shown[#shown].text:find('预记不等于',1,true) and not shown[#shown].timeout,'status details are complete and persistent')
+local thinking=find(plugin:getTranslationItems(),'翻译思考模式')
+local was=thinking.checked_func();thinking.callback()
+check(thinking.checked_func()~=was,'thinking check follows committed settings while menu stays open')
+thinking.callback()
+local actions=plugin:getLocalTranslationItems()[1].sub_item_table_func()
+find(actions,'阅读原文').callback()
+check(opened==r.original_path,'local filing directly opens original')
+plugin.ui.document={};plugin.ui.switchDocument=function(self,path) switches=path end
+find(actions,'阅读中文版').callback()
+check(switches==r.chinese_path,'reader uses normal switchDocument lifecycle')
+plugin.ui.document=nil;plugin.ui.switchDocument=nil
+plugin.sec_busy=true;opened=nil;find(actions,'阅读原文').callback();plugin.sec_busy=false
+check(not opened,'reading is blocked while a task owns the plugin')
+plugin:reportResult({{cik=co.cik,accession=filing.accn,name=co.name,form=filing.form,date=filing.date}},
+    {string.rep('完整失败原因',100)},{warnings={}})
+check(shown[#shown].kind=='textviewer' and #shown[#shown].text>260,'download report retains long error details')
+shown[#shown].buttons_table[1][1].callback()
+check(opened==r.original_path,'single download result directly opens verified original')
 check(yields>0,"real UI wiring tolerates yielding progress callbacks")
 plugin.sec_busy=true; local before=#shown
 plugin:prepareTranslation(co.cik,filing.accn)
@@ -264,4 +293,96 @@ plugin.ui.document=nil
 plugin:prepareCleanup({identity},{remove_reading_data=true}); cleanup=shown[#shown]
 cleanup.ok_callback(); cleanup.ok_callback()
 check(not Files.fileExists(r.paths.source) and not plugin.sec_busy and saves==settings_before and calls==requests_before,"confirmed cleanup runs once, without API, settings or watchlist writes")
+-- Explicit reset must run in the live settings owner and preserve unrelated settings.
+local function preferences()
+    local data=Files.copyValue(settings);data.sec_watchlist_filings=nil
+    return Files.serialize(data)
+end
+local other_before=preferences()
+local entry=plugin.watchlist.entries[1]
+entry.seen={"0000320193-26-000001"};entry.seen_upto_date="2026-10-01"
+entry.first_run_done=true;entry.pending_batch={version=99};entry.last_success_at=123;entry.content_chars=456
+local record_before=Files.serialize(plugin.watchlist.entries)
+plugin:resetDownloadHistory();local reset=shown[#shown]
+check(reset.kind=="confirmbox" and record_before==Files.serialize(plugin.watchlist.entries),"history reset preview has no mutation")
+plugin.sec_busy=true;reset.ok_callback();plugin.sec_busy=false
+check(record_before==Files.serialize(plugin.watchlist.entries),"task started after reset confirmation blocks reset")
+plugin:resetDownloadHistory();reset=shown[#shown]
+store.flush=function() return false,"reset disk failure" end
+reset.ok_callback();store.flush=real_flush
+check(record_before==Files.serialize(plugin.watchlist.entries) and other_before==preferences(),"failed reset restores history and preserves all unrelated settings")
+plugin:resetDownloadHistory();reset=shown[#shown];reset.ok_callback()
+local reset_saves=saves;reset.ok_callback()
+check(saves==reset_saves,"reset confirmation can only be consumed once")
+entry=plugin.watchlist.entries[1]
+check(#entry.seen==0 and not entry.seen_upto_date and not entry.first_run_done and not entry.pending_batch and not entry.last_success_at and not entry.content_chars,"confirmed reset clears precise download-state whitelist")
+check(other_before==preferences() and entry.forms[1]=="10-Q" and entry.enabled==false,"reset preserves credentials, old watchlist and company preferences")
+-- Unexpected preflight failures must release task ownership, without secrets.
+local old_estimate=Lib.estimate
+Lib.estimate=function() error('private-provider-secret') end
+local safe=pcall(function() plugin:prepareTranslation('320193','0000320193-26-000001') end)
+check(safe and not plugin.sec_busy,'preflight exception releases busy without escaping UI')
+check(not shown[#shown].text:find('private-provider-secret',1,true),'preflight exception never reflects raw secret')
+Lib.estimate=old_estimate
+plugin.sec_translation_active=true;plugin.sec_translation_cancelled=false
+plugin:onSuspend()
+check(plugin.sec_translation_cancelled,'manual suspend makes translation cancellation sticky')
+plugin.sec_translation_active=nil;plugin.sec_translation_cancelled=nil
+-- Full remaining task has its own explicit finite confirmation, never changes
+-- the saved small budget, and reserves each attempt durably before transport.
+settings.deepseek_api_key='offline-only';settings.translation_cache_only=false
+settings.translation_max_requests=5
+local wholefiling={accn='0000320193-26-000222',form='10-Q',date='2026-10-02'}
+assert(Files.ensureDir(plugin.sec_out_dir..'/'..Filing.companyDir(co)))
+local function original(filing)
+ local f=assert(io.open(Filing.outputPath(plugin.sec_out_dir,co,filing,'en'),'wb'));f:write('original');f:close()
+end
+original(wholefiling)
+local parts={};for i=1,48 do parts[i]='<p>Revenue whole '..i..'</p>' end
+assert(lib:register(co,wholefiling,{title='Whole',chapters={{id='one',html=table.concat(parts)}}}))
+local prior_calls,prior_network=calls,network
+plugin:prepareTranslation(co.cik,wholefiling.accn,true)
+local whole=shown[#shown]
+check(whole.kind=='confirmbox' and whole.ok_text:find('整份额度',1,true) and whole.text:find('6 请求 /',1,true) and whole.text:find('完整 HTTP',1,true),'whole task exposes independent finite batch/body caps')
+check(calls==prior_calls and network==prior_network and settings.translation_max_requests==5,'whole preflight is read-only and never raises stored small budget')
+local translatorClass=require('sec_translate');local old_request=translatorClass._request
+local reservations=0
+translatorClass._request=function(self,text,body)
+ local state=assert(lib:load(co.cik,wholefiling.accn)).state
+ assert(state.requests==self.request_count and state.wire_bytes==self.wire_bytes,'durable reservation precedes wire')
+ reservations=reservations+1
+ return old_request(self,text,body)
+end
+whole.ok_callback();whole.ok_callback();translatorClass._request=old_request
+check(calls-prior_calls==6 and reservations==6 and settings.translation_max_requests==5 and not plugin.sec_busy,'one confirmed whole task crosses small cap only under its six-attempt ledger; duplicate inert')
+check(assert(lib:load(co.cik,wholefiling.accn)).state.status=='complete','whole batch task publishes only on complete validated output')
+local failfiling={accn='0000320193-26-000223',form='10-Q',date='2026-10-03'}
+original(failfiling)
+assert(lib:register(co,failfiling,{title='Reservation failure',chapters={{id='one',html='<p>Revenue reserve 61</p>'}}}))
+plugin:prepareTranslation(co.cik,failfiling.accn,true);local failed_confirmation=shown[#shown]
+local save_state=Lib.saveState
+Lib.saveState=function(self,p,state)
+ if state.status=='translating' and (state.requests or 0)>0 then return nil,'injected checkpoint failure' end
+ return save_state(self,p,state)
+end
+prior_calls=calls;failed_confirmation.ok_callback();Lib.saveState=save_state
+check(calls==prior_calls and not plugin.sec_busy and shown[#shown].text:find('请求计数保存失败',1,true),'library reservation flush failure blocks every model dispatch and releases task')
+local netmgr=package.loaded['ui/network/manager'];local real_online=netmgr.runWhenOnline
+local queued
+netmgr.runWhenOnline=function(_,f) queued=f end
+plugin:prepareTranslation(co.cik,failfiling.accn,true);shown[#shown].ok_callback()
+check(type(queued)=='function' and not plugin.sec_busy,'waiting for network does not hold power or busy')
+prior_calls=calls;plugin:onSuspend();queued()
+check(calls==prior_calls and not plugin.sec_busy,'suspend revokes queued paid authorization before network callback')
+plugin:prepareTranslation(co.cik,failfiling.accn,true);local stale_confirm=shown[#shown]
+plugin:onSuspend();queued=nil;stale_confirm.ok_callback()
+check(queued==nil and calls==prior_calls,'confirmation displayed before suspend cannot authorize later fees')
+plugin:prepareTranslation(co.cik,failfiling.accn,true);shown[#shown].ok_callback();local stale_network=queued
+plugin:prepareTranslation(co.cik,failfiling.accn,true);stale_network()
+check(calls==prior_calls,'new preflight revokes the older pending confirmation')
+local current_confirm=shown[#shown];current_confirm.ok_callback()
+local real_translate=Lib.translate;local runs=0
+Lib.translate=function(self,...) runs=runs+1;return real_translate(self,...) end
+queued();queued();Lib.translate=real_translate;netmgr.runWhenOnline=real_online
+check(calls==prior_calls+1 and runs==1,'fresh queued authorization dispatches once and repeated network delivery is inert')
 print(string.format("real main/translation UI: %d checks passed; widgets/network are offline adapters",n))

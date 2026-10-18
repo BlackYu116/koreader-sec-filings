@@ -52,7 +52,6 @@ local OUT_DIR = SecJob.default_out_dir or "/mnt/us/documents/SEC 财报"
 
 --- 界面消息最多列这么多条失败原因，其余只进 crash.log。
 --- InfoMessage 的排版缺陷要求消息不能太高，所以这里必须有上限。
-local MAX_UI_ERRORS = 3
 --- 界面消息的字节上限（防止再撞上 appearance.koplugin 那个递归缺陷）。
 local MAX_UI_MSG = 260
 
@@ -65,7 +64,6 @@ local MAX_UI_MSG = 260
 local SEARCH_SINCE_YEARS = require("sec_search_ui").search_years
 local SEARCH_PAGE_SIZE = 20
 --- 类型筛选菜单里最多列几种类型（按份数从多到少；其余用「全部类型」看）。
-local SEARCH_FORM_CHOICES = 12
 --- 一眼能看出「这是财报」的三类。内部人交易（Form 4）一份就是几页，
 --- 在任意类型清单里会把它们彻底淹没，所以给一个一键跳过的入口。
 local REPORT_FORMS = { "10-K", "10-Q", "8-K" }
@@ -241,13 +239,13 @@ function SecFilings:getSubMenuItems()
 
     local watched = self:watchedCompanies()
     items[#items + 1] = {
-        text = T(_("下载全部关注的公司（%1 家 × 最近 %2 份）"), #watched, self:getLimit()),
+        text = T(_("更新关注公司（%1 家；每家每批最多 %2 份）"), #watched, self:getLimit()),
         sub_item_table_func = function() return self:getBulkDownloadItems() end,
     }
 
     items[#items + 1] = {
-        text = _("已有原文 → 生成 / 续译中文版"),
-        help_text = _("只读取本地原文。翻译前显示缓存情况与请求上限，不会重新下载或覆盖原文。"),
+        text = _("我的资料（已有原文与中文版）"),
+        help_text = _("直接阅读原文或中文，也可续译、恢复和重新关联。翻译前始终确认本次额度。"),
         sub_item_table_func = function() return self:getLocalTranslationItems() end,
     }
 
@@ -294,10 +292,41 @@ function SecFilings:getSubMenuItems()
     }
 
     items[#items + 1] = {
-        text = _("版本 0.2.3 · 下载与中断保护"),
-        callback = function() self:showMessage(_("原文缺失或书籍移动后，在「已有原文」确认恢复或重新关联。删书后打开「存储与清理」检查残留。不后台静默删除，不清空其他书的缓存或关注列表。")) end,
+        text = _("重置下载记录…"),
+        callback = function() self:resetDownloadHistory() end,
+    }
+
+    items[#items + 1] = {
+        text = _("版本 0.2.8 候选 · 阅读与质量修复"),
+        callback = function() self:showMessage(_("原文缺失或书籍移动后，在「我的资料」确认恢复或重新关联。删书后打开「存储与清理」检查残留。不后台静默删除，不清空其他书的缓存或关注列表。")) end,
     }
     return items
+end
+
+-- Reset state in the running settings owner, never by overwriting its file.
+-- This does not delete books, snapshots, credentials or subscription choices.
+function SecFilings:resetDownloadHistory()
+    if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行，不能重置。")); return end
+    local consumed=false
+    UIManager:show(require("ui/widget/confirmbox"):new{
+        text = _("重置全部关注公司的下载记录与未完成批次？下一次将重新选取最近若干份；已有原文会校验复用。不会删除书籍、阅读记录、邮箱、Key或其他设置。"),
+        ok_text = _("重置下载记录"),
+        ok_callback = function()
+            if consumed then return end
+            consumed=true
+            if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行，不能重置。")); return end
+            local Queue = require("sec_download_queue")
+            local before = Queue.snapshot(self.watchlist)
+            local ok, err = SecWatchlist.resetBaseline(self.watchlist,nil,{clear_stats=true})
+            if ok then ok,err=self:saveWatchlist() end
+            if not ok then
+                Queue.restore(self.watchlist,before)
+                self:showMessage(T(_("重置未完成，原下载记录已保留：%1"),tostring(err)))
+                return
+            end
+            self:showMessage(_("下载记录已重置；公司选择、书籍和其他设置未改变。"))
+        end,
+    })
 end
 
 --- 也让用户能只重跑失败的那一家。
@@ -379,10 +408,13 @@ function SecFilings:getWatchlistItems()
         local cik = e.cik
         sub[#sub + 1] = {
             text = self:watchLabel(e),
-            help_text = _("勾上 = 以后会被「下载全部关注的公司」带上；取消勾选不会删除，只是暂时不自动下。"),
+            help_text = _("勾上后会被“更新关注公司”带上；取消勾选不会删除书籍，也不影响临时下载。"),
             -- keep_menu_open：关注列表一般要连着勾好几家，每勾一下就关菜单会很难用。
             keep_menu_open = true,
-            checked_func = function() return e.enabled ~= false end,
+            checked_func = function()
+                local current = SecWatchlist.find(self.watchlist, cik)
+                return current ~= nil and current.enabled ~= false
+            end,
             callback = function() self:toggleWatch(cik) end,
         }
     end
@@ -404,47 +436,62 @@ function SecFilings:getWatchlistItems()
     return sub
 end
 
-function SecFilings:toggleWatch(cik)
-    local ok, info = SecWatchlist.toggle(self.watchlist, cik)
-    if not ok then
-        self:showMessage(T(_("没能改动关注列表：%1"), tostring(info)))
-        return
+-- Manual subscription edits are transactional too: a failed flush must not
+-- leave an optimistic live state that disappears after restart.
+function SecFilings:changeWatchlist(change)
+    if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行，暂不能修改关注。")); return nil end
+    local Queue = require("sec_download_queue")
+    local before = Queue.snapshot(self.watchlist)
+    local ok, saved = pcall(function()
+        local changed, err = change()
+        if not changed then
+            self:showMessage(T(_("没能改动关注列表：%1"), tostring(err)))
+            return nil
+        end
+        return self:saveWatchlist()
+    end) -- synchronous settings mutation only; no network or yielding callbacks
+    if not ok or not saved then
+        Queue.restore(self.watchlist, before)
+        if not ok then self:showMessage(_("关注保存发生异常，已还原本次改动。")) end
+        return nil
     end
-    self:saveWatchlist()
+    return true
+end
+
+function SecFilings:toggleWatch(cik)
+    return self:changeWatchlist(function() return SecWatchlist.toggle(self.watchlist, cik) end)
 end
 
 function SecFilings:setAllWatched(on)
-    local entries = SecWatchlist.list(self.watchlist, { live = true })
-    for wi = 1, #entries do
-        entries[wi].enabled = on and true or false
-    end
-    if self.watchlist then
+    return self:changeWatchlist(function()
+        local entries = SecWatchlist.list(self.watchlist, { live = true })
+        for wi = 1, #entries do entries[wi].enabled = on and true or false end
         self.watchlist.user_modified_at = os.time()
-    end
-    self:saveWatchlist()
+        return true
+    end)
 end
 
 --- 把搜索到的公司加进关注列表（已在列表里就打开它）。
 function SecFilings:watchCompany(company)
     if not company or not company.cik then return end
-    local wl = self.watchlist
-    local existing = SecWatchlist.find(wl, company.cik)
-    if not existing then
-        SecWatchlist.add(wl, {
-            cik = company.cik,
-            name = company.name,
-            ticker = company.ticker,
-        })
-    end
-    local e = SecWatchlist.find(wl, company.cik)
-    if e then
+    local saved = self:changeWatchlist(function()
+        local wl = self.watchlist
+        local e = SecWatchlist.find(wl, company.cik)
+        if not e then
+            local added, err = SecWatchlist.add(wl, {
+                cik=company.cik, name=company.name, ticker=company.ticker,
+            })
+            if not added then return nil, err end
+            e = SecWatchlist.find(wl, company.cik)
+        end
         e.enabled = true
         if company.name and not e.name then e.name = company.name end
         if company.ticker and not e.ticker then e.ticker = company.ticker end
-    end
-    if wl then wl.user_modified_at = os.time() end
-    self:saveWatchlist()
-    self:showMessage(T(_("已把「%1」加进关注列表。"), tostring(company.name or company.cik)))
+        wl.user_modified_at = os.time()
+        return true
+    end)
+    if saved then self:showMessage(T(_("已把「%1」加进关注列表。"), tostring(company.name or company.cik))) end
+    return saved
 end
 
 function SecFilings:isWatched(cik)
@@ -726,13 +773,13 @@ function SecFilings:getSearchItems()
     if company.cik and self:isWatched(company.cik) then
         sub[#sub + 1] = {
             text = T(_("「%1」已在关注列表里（点一下取消关注）"), tostring(company.name)),
-            help_text = _("关注列表里的公司会被「下载全部关注的公司」带上。"),
+            help_text = _("关注列表里的公司会被“更新关注公司”带上。"),
             callback = function() self:toggleWatch(company.cik); self:showSearchResults() end,
         }
     else
         sub[#sub + 1] = {
-            text = T(_("关注「%1」（以后自动下载新文件）"), tostring(company.name)),
-            help_text = _("关注之后不必每次自己搜；插件会按报表类型设置抓新的那几份。"),
+            text = T(_("关注「%1」（下次批量更新时检查）"), tostring(company.name)),
+            help_text = _("加入后可从“更新关注公司”检查新增；不会在后台自动下载。"),
             callback = function() self:watchCompany(company); self:showSearchResults() end,
         }
     end
@@ -746,15 +793,16 @@ function SecFilings:getSearchItems()
                 cik_pad = company.cik_pad,
                 name = company.name,
                 ticker = company.ticker,
+                ad_hoc = true,
             } })
         end,
     }
 
     if total == 0 then
-        sub[#sub + 1] = {
-            text = T(_("这 %1 年里没有符合条件的文件。"), SEARCH_SINCE_YEARS),
-            callback = function() self:showMessage(_("时间窗内没有文件。")) end,
-        }
+        local complete = self:searchResultsComplete(list)
+        local message = complete and T(_("这 %1 年里没有符合条件的文件。"), SEARCH_SINCE_YEARS)
+            or _("已取得的部分结果中暂无匹配；历史尚未完整取得，请重试查询。")
+        sub[#sub + 1] = {text=message, callback=function() self:showMessage(message) end}
         return sub
     end
 
@@ -764,7 +812,9 @@ function SecFilings:getSearchItems()
         local f = entries[fi]
         sub[#sub + 1] = {
             text = self:filingLabel(f),
-            close_search = true,
+            -- Keep this result/page underneath network prompts and the result summary.
+            -- Cancelling offline setup or finishing one filing must not lose the return path.
+            close_search = false,
             callback = function() self:startFilingDownload(company, f) end,
         }
     end
@@ -801,23 +851,18 @@ function SecFilings:getFormFilterItems()
     }
 
     local summary = st.summary or (st.list and st.list.form_summary) or {}
-    local shown = math.min(#summary, SEARCH_FORM_CHOICES)
-    for si = 1, shown do
+    -- Native Menu already paginates; do not hide rare forms after the twelfth.
+    for si = 1, #summary do
         local row = summary[si]
         local form = row.form
+        local count = 0
+        for candidate_index, candidate in ipairs(summary) do
+            if SecSearch.matchesForm(candidate.form, form) then count = count + (tonumber(candidate.count) or 0) end
+        end
         sub[#sub + 1] = {
-            text = T(_("%1（%2 份）"), tostring(form), tonumber(row.count) or 0),
+            text = T(_("%1（%2 份）"), tostring(form), count) .. (st.summary_partial and _(" · 不完整") or ""),
             checked_func = function() return st.form_key == form end,
             callback = function() self:setSearchForms({ form }) end,
-        }
-    end
-
-    if #summary > shown then
-        sub[#sub + 1] = {
-            text = T(_("还有 %1 种类型没列出来"), #summary - shown),
-            callback = function()
-                self:showMessage(_("类型太多，只列了份数最多的几种。"))
-            end,
         }
     end
 
@@ -863,22 +908,28 @@ end
 --- 只是多一步把 form 并进 entry.forms。
 function SecFilings:watchForm(company, form)
     if not company or not company.cik or not form or form == "" then return nil end
-    self:watchCompany(company)
-    local wl = self.watchlist
-    local e = SecWatchlist.find(wl, company.cik)
-    if not e then return nil end
-
-    local forms = {}
-    for fi = 1, #(e.forms or {}) do forms[#forms + 1] = e.forms[fi] end
-    local found = false
-    for fi = 1, #forms do
-        if forms[fi] == form then found = true end
-    end
-    if not found then forms[#forms + 1] = form end
-    e.forms = forms
-    if wl then wl.user_modified_at = os.time() end
-    self:saveWatchlist()
-    return e
+    local saved = self:changeWatchlist(function()
+        local wl = self.watchlist
+        local e = SecWatchlist.find(wl, company.cik)
+        if not e then
+            local ok, err = SecWatchlist.add(wl, company)
+            if not ok then return nil, err end
+            e = SecWatchlist.find(wl, company.cik)
+        end
+        e.enabled = true
+        if company.name and not e.name then e.name = company.name end
+        if company.ticker and not e.ticker then e.ticker = company.ticker end
+        local found = false
+        local forms = {}
+        for fi = 1, #(e.forms or {}) do
+            forms[fi] = e.forms[fi]
+            if forms[fi] == form then found = true end
+        end
+        if not found then forms[#forms + 1] = form end
+        e.forms, wl.user_modified_at = forms, os.time()
+        return true
+    end)
+    if saved then return SecWatchlist.find(self.watchlist, company.cik) end
 end
 
 --- companies 为 nil 时用关注列表里勾上的那些。
@@ -888,71 +939,17 @@ end
 function SecFilings:startDownload(companies, override)
     if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
     if override and override.translate then
-        self:showMessage(_("请先下载原文，再从「已有原文」菜单确认翻译。")); return
+        self:showMessage(_("请先下载原文，再从「我的资料」菜单确认翻译。")); return
     end
+    local Task = require("sec_task_guard")
+    Task.cancel(self)
+    local generation, dispatched = self.sec_cancel_generation, false
     NetworkMgr:runWhenOnline(function()
+        if dispatched or generation ~= self.sec_cancel_generation then return end
+        dispatched = true
         if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
-        local PluginShare = require("pluginshare")
-        local previous_pause = PluginShare.pause_auto_suspend
-        self.sec_busy = true
-        self.sec_download_active = true
-        self.sec_download_cancelled = false
-        PluginShare.pause_auto_suspend = true
-        -- Software suspend and Kindle powerd have separate timers. Keep the
-        -- native timer alive even when AutoSuspend is disabled, but never
-        -- override charging/KeepAlive safeguards or deliberate manual sleep.
-        local power_guard
-        local keep_awake
-        local released = false
-        local function release_pause()
-            if released then return end
-            released = true
-            if UIManager.unschedule then UIManager:unschedule(keep_awake) end
-            PluginShare.pause_auto_suspend = previous_pause
-        end
-        keep_awake = function()
-            if not self.sec_download_active or self.sec_download_cancelled then return false end
-            -- Timer callbacks are outside the job's xpcall. This non-yielding
-            -- callback needs its own boundary so it cannot crash the UI loop.
-            local ok, err = pcall(function()
-                local loader = require("pluginloader")
-                local autosuspend = loader:getPluginInstance("autosuspend")
-                if autosuspend and autosuspend.onInputEvent then autosuspend:onInputEvent() end
-                power_guard = power_guard or require("sec_download_power"):new(
-                    require("device"), PluginShare, function()
-                        return require("ui/time").to_number(UIManager:getElapsedTimeSinceBoot())
-                    end)
-                local protected, reason = power_guard:pulse()
-                if not protected then error("download power protection: " .. tostring(reason)) end
-                if reason == "reset" and autosuspend then
-                    -- Avoid a second renewal by upstream AutoSuspend this tick.
-                    autosuspend.last_t1_reset_time = UIManager:getElapsedTimeSinceBoot()
-                end
-                if UIManager.scheduleIn then UIManager:scheduleIn(60, keep_awake) end
-            end)
-            if not ok then
-                self.sec_download_cancelled = true
-                release_pause()
-                logger.warn("secfilings: activity heartbeat failed", err)
-            end
-            return ok
-        end
-        Trapper:wrap(function()
-            -- Native Trapper uses the same yieldable LuaJIT xpcall boundary.
-            -- Cleanup must also run after unexpected exceptions, not only success.
-            local ok, err = xpcall(function()
-                if not keep_awake() then error("下载活动保护未能启动") end
-                self:runJob(companies, override)
-            end, debug.traceback)
-            release_pause()
-            self.sec_download_active = nil
-            self.sec_download_cancelled = nil
-            self.sec_busy = false
-            if not ok then
-                Trapper:reset()
-                logger.warn("secfilings: download failed", err)
-                self:showMessage(_("下载已中断，已完成的原文保留。可重新下载继续；详情见日志。"))
-            end
+        Task.run(self, "download", function()
+            self:runJob(companies, override)
         end)
     end)
 end
@@ -960,7 +957,8 @@ end
 -- Manual sleep is not prevented. Stop at the next safe checkpoint after wakeup;
 -- a suspended Kindle cannot promise network progress in the background.
 function SecFilings:onSuspend()
-    if self.sec_download_active then self.sec_download_cancelled = true end
+    self.search_pending = nil -- revoke pending network callbacks as well as paid/download tasks
+    require("sec_task_guard").cancel(self)
 end
 
 --- An explicit search selection downloads exactly that filing without changing subscriptions.
@@ -1023,6 +1021,7 @@ function SecFilings:jobOpts(companies, override)
         -- and save final baseline again when the batch ends.
         watchlist       = self.watchlist,
         on_filing_committed = function() return self:saveWatchlist() end,
+        on_watchlist_checkpoint = function() return self:saveWatchlist() end,
 
         -- 封面素材目录（<cik>.jpg + generic.jpg）
         cover_dir       = self:getCoverDir(),
@@ -1052,11 +1051,22 @@ function SecFilings:runJob(companies, override)
         return continued and not self.sec_download_cancelled
     end
 
+    local Trace = require("sec_download_trace")
+    Trace.mark("batch","start")
     local results, errors, info = SecJob.run(list, self:jobOpts(list, override), progress_cb)
+    info = info or {}
+    Trace.mark("batch","end")
 
     Trapper:reset()
-    -- Persist before presenting a dialog (or handling a pending suspend).
-    self:saveWatchlist()
+    -- A failed checkpoint has already restored the last confirmed state.
+    -- Do not turn persistence failure into apparent success via an unchecked retry.
+    if not info.persistence_failed then
+        local saved, save_err = self:saveWatchlist()
+        if not saved then
+            info.persistence_failed=true
+            errors[#errors+1]="最终下载状态未能保存：" .. tostring(save_err)
+        end
+    end
     if self.sec_download_cancelled then
         errors[#errors+1] = "设备休眠，下载已暂停；已完成原文保留，请再次下载继续。"
     end
@@ -1085,15 +1095,15 @@ function SecFilings:explainError(err, kind)
     return msg
 end
 
---- 汇报结果。日志里留全量，界面上只留摘要。
+--- 汇报结果。短摘要在前，全部警告与错误保留在可滚动详情中。
 function SecFilings:reportResult(results, errors, info)
     logger.info(string.format(
-        "secfilings: ==== 本轮结束：成功 %d 家，失败 %d 家 ====", #results, #errors))
+        "secfilings: ==== 本轮结束：可用成品 %d，错误 %d 项 ====", #results, #errors))
     for ei = 1, #errors do
         logger.warn(string.format("secfilings: [失败] %s", tostring(errors[ei])))
     end
     -- 第三返回值是 sec_job 新加的汇总（旧的两返回值写法也照样能用）。
-    -- 全量只进日志；界面上只挑一两句能看懂的说。
+    -- 日志与可滚动结果保留完整说明，避免丢失恢复操作提示。
     if type(info) == "table" then
         logger.info(string.format(
             "secfilings: 计划 %s / 成书 %s / 无新文件 %s / 图片 %s（失败 %s）/ 指标成功 %s 失败 %s",
@@ -1126,23 +1136,35 @@ function SecFilings:reportResult(results, errors, info)
             lines[#lines + 1] = table.concat(bits, "，")
         end
         -- 警告里可能有「图片疑似没进包」这类真问题，至少露一条出来
-        if type(info.warnings) == "table" and #info.warnings > 0 then
-            lines[#lines + 1] = tostring(info.warnings[1])
+        if type(info.warnings) == "table" then
+            for wi = 1, #info.warnings do lines[#lines+1] = tostring(info.warnings[wi]) end
         end
     end
 
-    local shown = math.min(#errors, MAX_UI_ERRORS)
-    for ei = 1, shown do
+    for ei = 1, #errors do
         lines[#lines + 1] = tostring(errors[ei])
-    end
-    if #errors > shown then
-        lines[#lines + 1] = T(_("……另有 %1 条，详见 crash.log"), #errors - shown)
     end
     if #results > 0 then
         lines[#lines + 1] = _("文件在书库的「SEC 财报」分类里。")
     end
 
-    self:showMessage(table.concat(lines, "\n"))
+    local dialog
+    local buttons
+    if #results > 0 then
+        buttons={{{text=#results==1 and _("立即阅读原文") or _("选择本轮原文阅读"),
+            callback=function() self:showDownloadedBooks(results,dialog) end}}}
+    end
+    dialog=self:showDetails(_("下载结果"),table.concat(lines, "\n"),buttons)
+end
+
+-- Persistent, scrollable details; do not enlarge the historically fragile InfoMessage.
+function SecFilings:showDetails(title, text, buttons)
+    local viewer = require("ui/widget/textviewer"):new{
+        title = title, text = tostring(text), buttons_table = buttons,
+        add_default_buttons = true,
+    }
+    UIManager:show(viewer)
+    return viewer
 end
 
 function SecFilings:showMessage(text)

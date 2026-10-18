@@ -6,11 +6,13 @@ local Search=require('sec_search')
 local _=require('gettext')
 local T=require('ffi/util').template
 local SearchUI={search_years=3,search_max_total=5000}
-local function active(self,token) return token and self.search_pending==token end
+local function active(self,token)
+    return token and self.search_pending==token and token.generation==self.sec_cancel_generation
+end
 local function begin(self)
     if self.sec_busy then self:showMessage(_('已有 SEC 任务正在运行。')); return nil end
     self:closeSearchPanel()
-    local token={}; self.search_pending=token; return token
+    local token={generation=self.sec_cancel_generation}; self.search_pending=token; return token
 end
 local function finish(self,token,message)
     if not active(self,token) then return end
@@ -32,6 +34,7 @@ local function complete(list)
         and list.form_summary_scope~='partial'
         and (not list.stats or (list.stats.sources_failed or 0)==0)
 end
+function SearchUI:searchResultsComplete(list) return complete(list) end
 local function formKey(forms) return forms and table.concat(forms,',') or '*' end
 local function saveView(st)
     st.views=st.views or {}
@@ -88,14 +91,32 @@ end
 function SearchUI:showSearchResults()
     local rows=self:getSearchItems()
     local st=self.search_state
-    if st and st.candidates and self.search_last_results then
-        table.insert(rows,1,{text=_('返回上一份查询结果'),callback=function()
-            self.search_state=self.search_last_results; self:showSearchResults()
-        end})
+    if st and st.candidates then
+        if st.candidates_truncated then
+            table.insert(rows,1,{text=T(_('共 %1 家，仅显示前 %2 家；请缩小关键词'),st.candidates_total or #st.candidates,#st.candidates),enabled=false})
+        end
+        if self.search_last_results then
+            table.insert(rows,1,{text=_('返回上一份查询结果'),callback=function()
+                self.search_state=self.search_last_results; self:showSearchResults()
+            end})
+        end
     elseif st and st.list and not complete(st.list) then
         table.insert(rows,1,{text=_('结果不完整：达到上限或部分历史未取得'),enabled=false})
     end
+    if st and st.company and st.list then
+        table.insert(rows,1,{text=_('重新获取当前结果'),callback=function() self:refreshSearch() end})
+    end
     self:showSearchPanel(rows,self:searchStateLabel(),false)
+end
+function SearchUI:refreshSearch()
+    local st=self.search_state
+    if not st or not st.company then return end
+    local forms
+    if st.form_key then
+        forms={}; for form in st.form_key:gmatch('[^,]+') do forms[#forms+1]=form end
+    end
+    local token=begin(self); if not token then return end
+    dispatch(self,token,function() self:refilterSearch(forms,token,st,true) end)
 end
 function SearchUI:startSearch(query)
     local token=begin(self); if not token then return end
@@ -110,7 +131,8 @@ function SearchUI:runSearch(query,token)
     if not ok then finish(self,token,T(_('查找失败：%1'),self:explainError(res,kind))); return end
     local aliases=res.aliases or {res}
     if #aliases>1 and (res.ambiguous or res.tie) then
-        self.search_state={query=query,candidates=aliases}
+        self.search_state={query=query,candidates=aliases,candidates_total=res.candidates_total,
+            candidates_truncated=res.candidates_truncated}
         finish(self,token); return
     end
     self:loadFilings(res,query,nil,token)
@@ -131,7 +153,8 @@ function SearchUI:loadFilings(res,query,form,token)
         cik_pad=list.cik or res.cik,name=list.name or res.name or tostring(res.cik),
         ticker=(res.tickers and res.tickers[1]) or res.ticker},
         list=list,form=form,form_key=form,page=1,views={},menu_pages={},
-        summary=list.form_summary_all or list.form_summary}
+        summary=list.form_summary_window or list.form_summary,
+        summary_partial=not complete(list)}
     if not form then st.full_list=list end
     self.search_state=st; self.search_last_results=st
     finish(self,token)
@@ -164,7 +187,7 @@ function SearchUI:setSearchForms(forms)
     end
     dispatch(self,token,function() self:refilterSearch(forms,token,st) end)
 end
-function SearchUI:refilterSearch(forms,token,st)
+function SearchUI:refilterSearch(forms,token,st,refresh)
     st=st or self.search_state
     if not st or not st.company then return end
     token=token or begin(self); if not token or not active(self,token) then return end
@@ -173,8 +196,19 @@ function SearchUI:refilterSearch(forms,token,st)
     local ok,list,kind=Search:listFilings(st.company.cik,self:filingSearchOptions(forms))
     if not active(self,token) or self.search_state~=st then return end
     if not ok then finish(self,token,T(_('筛选失败：%1'),self:explainError(list,kind))); return end
+    if refresh then
+        st.views,st.menu_pages={},{}
+        st.full_list=nil -- never reintroduce a pre-refresh full snapshot on the next filter
+        if list.form_summary_window then
+            st.summary=list.form_summary_window
+            st.summary_partial=not complete(list)
+        end
+    end
     st.list,st.form,st.form_key,st.page=list,forms and table.concat(forms,'/'),forms and table.concat(forms,','),1
-    if not forms then st.full_list=list; st.summary=list.form_summary_all or list.form_summary end
+    if not forms then
+        st.full_list=list; st.summary=list.form_summary_window or list.form_summary
+        st.summary_partial=not complete(list)
+    end
     finish(self,token)
 end
 return SearchUI

@@ -49,6 +49,7 @@ check(not read(r.paths.source):find("offline-key",1,true),"snapshot has no crede
 local path,err=lib:translate(r.paths.cik,r.paths.accn,make{translation_max_requests=1})
 check(not path and err:find("上限",1,true) and calls==1,"one-request budget pauses mid-document")
 check(assert(lib:load(r.paths.cik,r.paths.accn)).state.status=="paused","paused state persisted")
+check(assert(lib:load(r.paths.cik,r.paths.accn)).state.last_error:find("上限",1,true),"pause reason survives restart")
 local reopened=Library:new{work_dir=lib.work_dir,out_dir=lib.out_dir}
 local entries=assert(reopened:list())
 check(#entries==1 and entries[1].status=="paused","restart finds pending original independently of watchlist")
@@ -60,6 +61,7 @@ check(not path and calls==before and err:find("仅缓存",1,true),"cache-only mi
 path=assert(reopened:translate(r.paths.cik,r.paths.accn,make()))
 check(calls==3 and packed==1,"resume dispatches only missing blocks")
 check(assert(lib:load(r.paths.cik,r.paths.accn)).state.status=="complete","complete committed after output")
+check(assert(lib:load(r.paths.cik,r.paths.accn)).state.last_error==nil,"successful retry clears previous failure")
 check(read(r.original_path)=="untouched-original-resume" and read(r.original_path .. ".sdr/progress")=="page=37","original bytes and reading progress unchanged")
 assert(Files.ensureDir(path .. ".sdr")); write(path .. ".sdr/progress","page=8")
 local completed=read(path)
@@ -116,6 +118,7 @@ local packer=package.loaded["sec_epub"].write
 package.loaded["sec_epub"].write=function() return nil,"forced" end
 path,err=fail:translate(fr.paths.cik,fr.paths.accn,fmake())
 check(not path and assert(fail:load(fr.paths.cik,fr.paths.accn)).state.status=="failed" and not Files.fileExists(fr.chinese_path),"packer failure never marks complete or publishes")
+check(assert(fail:load(fr.paths.cik,fr.paths.accn)).state.last_error=="中文 EPUB 打包失败","safe failure reason retained without raw packer error")
 package.loaded["sec_epub"].write=packer
 before=calls; path=assert(fail:translate(fr.paths.cik,fr.paths.accn,fmake{translation_cache_only=true,deepseek_api_key=""}))
 check(path and calls==before,"packaging retry uses caches without key")
@@ -178,4 +181,10 @@ local deletion=assert(lifecycle:preview({mr.paths.cik .. ":" .. mr.paths.accn},{
 assert(lifecycle:execute(deletion))
 check(not Files.fileExists(scoped) and Files.fileExists(mt.cache_dir) and Files.fileExists(second.chinese_path)
     and Files.fileExists(shared) and calls==before,"deleting one completed filing leaves another filing and legacy shared cache intact")
+check(migrated:readingPath(second.paths.cik,second.paths.accn,'en')==second.original_path,'reading resolves registered original')
+check(migrated:readingPath(second.paths.cik,second.paths.accn,'zh')==second.chinese_path,'reading resolves verified Chinese output')
+write(second.original_path,'external edit')
+check(not migrated:readingPath(second.paths.cik,second.paths.accn,'en'),'reading refuses externally changed original')
+check(migrated:readingPath(second.paths.cik,second.paths.accn,'zh')==second.chinese_path,'Chinese reading does not require original or source assets')
+check(not migrated:readingPath(second.paths.cik,second.paths.accn,'other'),'unknown reading language rejected')
 print(string.format("library: %d checks passed; API and EPUB writer are offline spies",count))

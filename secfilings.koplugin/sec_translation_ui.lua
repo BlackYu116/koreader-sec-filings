@@ -8,17 +8,35 @@ local Library = require("sec_library")
 local _ = require("gettext")
 local T = require("ffi/util").template
 local TranslationUI = {}
+local Translate = require("sec_translate")
+local Task = require("sec_task_guard")
+
+function TranslationUI:showTranslationStatus(entry)
+    local record, err = Library:new(self:translationOptions()):load(entry.cik, entry.accn)
+    if not record then self:showMessage(err); return end
+    local state = record.state
+    local reason = state.last_error and Translate.failureSummary(state.last_error)
+        or (state.status == "failed" and "旧版本未记录具体失败原因。已保存的缓存仍可续用。" or "无已记录错误。")
+    local labels={pending="待翻译",translating="待续译",paused="已暂停",failed="上次未完成",
+        publishing="待确认成品",complete="已完成"}
+    self:showDetails(_("翻译进度与上次原因"),string.format("状态：%s\n%s\n\n全部翻译完成后才生成独立中文版；未完成时保留成功块缓存，请重新预检后续译。\n\n%s · %s · %s\n%s\n上次任务预记/尝试 %d 次 / 正文 %d 字节\n预记不等于服务方实际收费；中断时可能包含尚未发送的一次。",
+        labels[state.status] or state.status, reason, record.source.company.name,
+        record.source.filing.form, record.source.filing.date, entry.accn,
+        tonumber(state.requests) or 0, tonumber(state.input_bytes) or 0))
+end
 
 -- Trapper:info yields for 100 ms on every update. A financial report can contain
 -- thousands of text nodes; refreshing per node would turn a local check into minutes.
 -- Yield about once per second, including while scanning cached/numeric content.
-local function responsiveProgress()
+local function responsiveProgress(owner)
     local last_second
     return function(message)
+        if Task.cancelled(owner) then return false end
         local now = os.time()
         if now == last_second then return true end
         last_second = now
-        return Trapper:info(message)
+        local continued = Trapper:info(message)
+        return continued and not Task.cancelled(owner)
     end
 end
 
@@ -46,7 +64,8 @@ function TranslationUI:getTranslationItems()
         callback = function() self:deepSeekModelDialog() end,
     }
     items[#items + 1] = {
-        text = self:deepSeekThinking() and _("翻译思考模式：开") or _("翻译思考模式：关"),
+        text = _("翻译思考模式（勾选为开启）"),
+        checked_func = function() return self:deepSeekThinking() end,
         help_text = _("默认关闭，以减少 Kindle 等待时间和 API 成本。"),
         keep_menu_open = true,
         callback = function()
@@ -132,6 +151,7 @@ function TranslationUI:translationOptions()
         deepseek_api_key=self:getDeepSeekKey(), deepseek_model=self:deepSeekModel(),
         deepseek_thinking=self:deepSeekThinking(), translation_max_requests=max_requests,
         translation_max_input_bytes=max_requests * 2400,
+        translation_batch_mode=true,
         translation_cache_only=self.settings:readSetting("translation_cache_only") == true}
 end
 
@@ -167,18 +187,17 @@ function TranslationUI:getLocalTranslationItems(page)
     return items
 end
 
-function TranslationUI:prepareTranslation(cik, accn)
+function TranslationUI:prepareTranslation(cik, accn, whole)
     if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
-    self.sec_busy = true
+    Task.cancel(self) -- a new preflight supersedes older, pending authorizations
+    local generation = self.sec_cancel_generation
     local opts = self:translationOptions()
     local library = Library:new(opts)
     local translator = library:translator(opts)
-    Trapper:wrap(function()
-        local progress = responsiveProgress()
+    Task.run(self, "preflight", function()
+        local progress = responsiveProgress(self)
         local stats, record = library:estimate(cik, accn, translator,
             function() return progress(_("正在检查本地原文与翻译缓存…")) end)
-        Trapper:reset()
-        self.sec_busy = false
         if not stats then self:showMessage(record); return end
         if stats.requests > 0 and not translator.cache_only and opts.deepseek_api_key == "" then
             self:showMessage(_("仍有未缓存内容。请先在翻译设置填写 API Key，或开启仅缓存模式。")); return
@@ -186,27 +205,45 @@ function TranslationUI:prepareTranslation(cik, accn)
         -- Freeze source and settings shown in the confirmation. An all-cached plan cannot turn paid.
         translator.expected_source_hash = record.state.source_hash
         translator.cache_only = translator.cache_only or stats.requests == 0
-        local mode = translator.cache_only and _("仅使用缓存，不联网") or _("将向 DeepSeek 发送未缓存的原文")
-        local text = string.format("%s\n%s\n模型：%s；思考：%s\n待请求约 %d 块；缓存命中 %d 块\n本轮至多 %d 请求 / %d 输入字节\n每请求至多 %d 输出 tokens\n不是金额预算；失败请求也可能收费。\n原文不变，未完成可续译。", record.source.company.name,
+        if whole and not translator.cache_only then
+            if stats.requests > 1000 or stats.input_bytes > 2000000 or stats.wire_bytes > 16384000 then
+                self:showMessage(_("剩余任务超过一次整份授权的安全上限，请先使用小额度续译。")); return
+            end
+            translator.max_requests = stats.requests
+            translator.max_input_bytes = stats.input_bytes
+            translator.max_wire_bytes = stats.wire_bytes
+        end
+        local mode = translator.cache_only and _("仅使用缓存，不联网")
+            or whole and _("整份剩余任务：本次确认后连续执行，不自动重试或提高额度")
+            or _("小额度任务：达到本次上限后暂停")
+        local text = string.format("%s\n%s\n模型：%s；思考：%s\n未缓存 %d 块，预计 %d 批请求；缓存命中 %d 块\n本任务至多 %d 请求 / %d 正文字节\n完整 HTTP 请求体合计至多 %d 字节；单次至多 16384 字节\n每请求 max_tokens=%d\n不是金额预算；输入、思考及失败请求可能收费，实际以服务方账单为准。\n原文不变；锁屏、取消、错误或额度用尽都会停止，重新打开不会自动收费。",
+            string.format("%s · %s · %s\n%s", record.source.company.name, record.source.filing.form, record.source.filing.date, record.source.filing.accn),
             mode, translator.model, translator.thinking and _("开") or _("关"),
-            stats.requests, stats.cache_hits, translator.cache_only and 0 or translator.max_requests,
-            translator.cache_only and 0 or translator.max_input_bytes, translator.max_output_tokens)
+            stats.blocks or stats.requests, stats.requests, stats.cache_hits,
+            translator.cache_only and 0 or translator.max_requests,
+            translator.cache_only and 0 or translator.max_input_bytes,
+            translator.cache_only and 0 or translator.max_wire_bytes, translator.max_output_tokens)
+        text = text .. "\n全部块完成后才生成整本；未完成时缓存保留。"
+        if not whole and not translator.cache_only and stats.requests > translator.max_requests then
+            text = text .. "\n若希望一次连续处理，可取消并选择“整份剩余译文”。"
+        end
+        if record.state.last_error then text = text .. "\n上次：" .. Translate.failureSummary(record.state.last_error) end
         local used = false
-        UIManager:show(ConfirmBox:new{text=text, ok_text=_("生成 / 续译"), ok_callback=function()
-            if used or self.sec_busy then return end
+        UIManager:show(ConfirmBox:new{text=text, ok_text=whole and _("确认本次整份额度") or _("生成 / 续译"), ok_callback=function()
+            if used or self.sec_busy or generation ~= self.sec_cancel_generation then return end
             used = true
+            local dispatched = false
             local function run()
+                if dispatched or generation ~= self.sec_cancel_generation then return end
+                dispatched = true
                 if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行，请稍后重试。")); return end
-                self.sec_busy = true
-                Trapper:wrap(function()
-                    local progress = responsiveProgress()
+                Task.run(self, "translation", function()
+                    local progress = responsiveProgress(self)
                     local path, err, result = library:translate(cik, accn, translator, progress)
-                    Trapper:reset()
-                    self.sec_busy = false
                     if path then
-                        self:showMessage(result == "reused" and _("中文版已完成，保留原文件与阅读进度。")
-                            or _("中文版已生成，与原文保存在同一公司目录。"))
-                    else self:showMessage(err) end
+                        self:showReadingResult(result == "reused" and _("中文版已完成，保留原文件与阅读进度。")
+                            or _("中文版已生成，与原文保存在同一公司目录。"),cik,accn,'zh')
+                    else self:showDetails(_("翻译未完成"),tostring(err) .. string.format("\n请重新预检后续译，无需删除缓存。\n本轮请求 %d/%d · 缓存命中 %d\n本轮未确认完成。", translator.request_count, translator.max_requests, translator.cache_hits)) end
                 end)
             end
             if translator.cache_only then run() else NetworkMgr:runWhenOnline(run) end

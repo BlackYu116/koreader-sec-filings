@@ -15,8 +15,14 @@ end
 function StorageUI:getLocalFilingActions(entry)
     local id=entry.cik..':'..entry.accn
     return {
-        {text=_("生成 / 续译中文版"),enabled=entry.original_present,
+        {text=_("阅读原文"),enabled=entry.original_present,
+            callback=function() self:openLocalFiling(entry.cik,entry.accn,'en') end},
+        {text=_("阅读中文版"),enabled=entry.chinese_present,
+            callback=function() self:openLocalFiling(entry.cik,entry.accn,'zh') end},
+        {text=_("生成 / 续译中文版（小额度）"),enabled=entry.original_present,
             callback=function() self:prepareTranslation(entry.cik,entry.accn) end},
+        {text=_("整份剩余译文（先预检与确认额度）"),enabled=entry.original_present,
+            callback=function() self:prepareTranslation(entry.cik,entry.accn,true) end},
         {text=_("恢复原文（不联网）…"),enabled=not entry.original_present,
             callback=function() self:prepareOriginalRecovery(entry.cik,entry.accn) end},
         {text=_("重新关联原文位置…"),enabled=not entry.original_present,
@@ -27,7 +33,49 @@ function StorageUI:getLocalFilingActions(entry)
             callback=function() self:prepareCleanup({id},{remove_books=true,remove_reading_data=true}) end},
         {text=_("存储与清理（检查移动及残留）"),
             sub_item_table_func=function() return self:getStorageItems() end},
+        {text=_("查看翻译进度与上次原因"),
+            callback=function() self:showTranslationStatus(entry) end},
     }
+end
+function StorageUI:openLocalFiling(cik,accn,language,dialog)
+    if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
+    local lib=require('sec_library'):new(self:translationOptions())
+    local path,err=lib:readingPath(cik,accn,language)
+    if not path then self:showDetails(_("暂时无法阅读"),err); return end
+    -- Revoke old deferred network work before leaving this plugin instance.
+    self.search_pending=nil
+    require('sec_task_guard').cancel(self)
+    self:closeSearchPanel()
+    if dialog then UIManager:close(dialog) end
+    if self.ui and self.ui.document then
+        self.ui:switchDocument(path) -- normal reader teardown saves reading state
+    else
+        require('apps/reader/readerui'):showReader(path)
+    end
+    return true
+end
+function StorageUI:showReadingResult(text,cik,accn,language)
+    local dialog
+    dialog=self:showDetails(_("任务结果"),text,{{{text=_("立即阅读"),callback=function()
+        self:openLocalFiling(cik,accn,language,dialog)
+    end}}})
+end
+function StorageUI:showDownloadedBooks(results,dialog)
+    if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
+    if #results==1 then
+        return self:openLocalFiling(results[1].cik,results[1].accession,'en',dialog)
+    end
+    local menu
+    local items={}
+    for i,result in ipairs(results) do
+        local entry=result
+        items[#items+1]={text=string.format('%s · %s · %s',entry.name,entry.form,entry.date),
+            callback=function() self:openLocalFiling(entry.cik,entry.accession,'en',menu) end}
+    end
+    menu=require('ui/widget/menu'):new{title=_("选择本轮原文阅读"),item_table=items}
+    menu.onMenuSelect=function(widget,item) if item.callback then item.callback() end;return true end
+    if dialog then UIManager:close(dialog) end
+    UIManager:show(menu)
 end
 function StorageUI:prepareCleanup(ids, opts)
     if self.sec_busy then self:showMessage(_("已有 SEC 任务正在运行。")); return end
@@ -95,6 +143,18 @@ function StorageUI:getStorageItems()
         items[#items+1]={text=current.name..' · '..(current.date or '旧合集')..' · '..(labels[current.status] or current.status),
             sub_item_table_func=function()
                 local actions={}
+                if current.kind=='filing' and not current.blocked then
+                    if not current.original_present then
+                        actions[#actions+1]={text=_("查找并关联原文…"),callback=function()
+                            self:prepareRelink(current.cik,current.accn,'en') end}
+                        actions[#actions+1]={text=_("从快照恢复原文（不联网）…"),callback=function()
+                            self:prepareOriginalRecovery(current.cik,current.accn) end}
+                    end
+                    if not current.chinese_present and current.output_hash then
+                        actions[#actions+1]={text=_("查找并关联中文版…"),callback=function()
+                            self:prepareRelink(current.cik,current.accn,'zh') end}
+                    end
+                end
                 if current.blocked then
                     actions[#actions+1]={text=_("查看保留原因"),callback=function() self:showMessage(current.blocked) end}
                 elseif current.status=='missing' then
